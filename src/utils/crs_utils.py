@@ -1,7 +1,3 @@
-
-# src/utils/crs_utils.py
-# all comments in lowercase; variable names in snake_case
-
 from __future__ import annotations
 from pathlib import Path
 from typing import Optional, Union
