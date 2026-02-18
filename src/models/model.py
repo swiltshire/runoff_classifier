@@ -1,4 +1,3 @@
-# all variable names are snake_case and all comments are lowercase
 from __future__ import annotations
 import torchvision
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor

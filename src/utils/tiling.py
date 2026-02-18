@@ -1,6 +1,3 @@
-
-# all variable names are snake_case and all comments are lowercase
-
 from __future__ import annotations
 from typing import List, Tuple
 import random

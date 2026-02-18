@@ -1,5 +1,3 @@
-
-# all variable names are snake_case and all comments are lowercase
 from __future__ import annotations
 import os
 import json
@@ -8,6 +6,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import sys
+import glob
 
 # add project root to path
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -42,9 +41,69 @@ def parse_args():
     return args
 
 
+
+def build_vrt_from_tifs(files, out_vrt):
+    # build a vrt using python gdal only
+    try:
+        from osgeo import gdal
+    except ImportError:
+        raise RuntimeError("Python GDAL (osgeo.gdal) is not installed.")
+
+    gdal.UseExceptions()
+    os.makedirs(os.path.dirname(out_vrt) or ".", exist_ok=True)
+
+    vrt = gdal.BuildVRT(out_vrt, [os.path.abspath(f) for f in files])
+    if vrt is None:
+        raise RuntimeError("gdal.BuildVRT failed to create the VRT.")
+    vrt.FlushCache()
+    vrt = None
+
+
+def resolve_raster_input(path_or_dir):
+    """
+    If path_or_dir is a directory of .tif tiles or a *.tif glob:
+      → Build a VRT one level up from the tiles folder.
+    Otherwise:
+      → Return path_or_dir unchanged.
+    """
+    # directory of tifs
+    if os.path.isdir(path_or_dir):
+        files = sorted(glob.glob(os.path.join(path_or_dir, "*.tif")))
+        if not files:
+            raise FileNotFoundError(f"no .tif files found in {path_or_dir}")
+
+        parent = os.path.dirname(os.path.abspath(path_or_dir))
+        parent_name = os.path.basename(parent)
+        out_vrt = os.path.join(parent, f"{parent_name}_mosaic.vrt")
+
+        build_vrt_from_tifs(files, out_vrt)
+        return out_vrt
+
+    # glob (*.tif)
+    if any(ch in path_or_dir for ch in ["*", "?", "["]):
+        files = sorted(glob.glob(path_or_dir))
+        if not files:
+            raise FileNotFoundError(f"glob matched no .tif files: {path_or_dir}")
+
+        tile_dir = os.path.dirname(os.path.abspath(path_or_dir))
+        parent = os.path.dirname(tile_dir)
+        parent_name = os.path.basename(parent)
+        out_vrt = os.path.join(parent, f"{parent_name}_mosaic.vrt")
+
+        build_vrt_from_tifs(files, out_vrt)
+        return out_vrt
+
+    # passthrough
+    return path_or_dir
+
+
+
 def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
+
+    # convert tiles to vrt if needed
+    args.raster_path = resolve_raster_input(args.raster_path)
 
     # normalize training labels to raster crs so geometry aligns with imagery
     args.labels_path = normalize_labels_crs(
