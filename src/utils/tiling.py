@@ -7,6 +7,58 @@ from rasterio.windows import Window
 import geopandas as gpd
 
 
+def filter_windows_by_mask(
+    raster_path: str,
+    windows: List[Window],
+    mask_path: str,
+    min_cover_frac: float = 0.0,
+) -> List[Window]:
+    """
+    Keep only windows whose map-space rectangle intersects the mask polygons.
+    Optionally require that the intersection area covers at least `min_cover_frac`
+    of the window polygon (0.0..1.0).
+    """
+    if min_cover_frac < 0.0 or min_cover_frac > 1.0:
+        raise ValueError("min_cover_frac must be in [0,1].")
+
+    gdf = gpd.read_file(mask_path)
+    if gdf.empty:
+        return []  # nothing to search
+    with rasterio.open(raster_path) as src:
+        win_to_world = src.transform
+        raster_crs = src.crs
+
+    # reproject mask -> raster CRS if needed, dissolve for faster intersects
+    if gdf.crs != raster_crs:
+        gdf = gdf.to_crs(raster_crs)
+    mask_union = gdf.unary_union  # shapely geometry
+
+    kept = []
+    # precompute window area in map units when we need coverage ratio
+    need_area = (min_cover_frac > 0.0)
+
+    for w in windows:
+        # map-space rectangle of the window
+        # NOTE: transform * (col,row) yields map coords; window is in pixel coords
+        x0, y0 = win_to_world * (w.col_off,               w.row_off)
+        x1, y1 = win_to_world * (w.col_off + w.width,     w.row_off + w.height)
+        wx0, wx1 = sorted([x0, x1])
+        wy0, wy1 = sorted([y0, y1])
+        w_geom = box(wx0, wy0, wx1, wy1)
+
+        if not w_geom.intersects(mask_union):
+            continue
+        if need_area:
+            inter = w_geom.intersection(mask_union)
+            if inter.is_empty:
+                continue
+            cover = inter.area / w_geom.area if w_geom.area > 0 else 0.0
+            if cover < min_cover_frac:
+                continue
+        kept.append(w)
+    return kept
+
+
 def make_grid_windows(raster_path: str, tile_size: int, stride: int) -> List[Window]:
     # create a list of sliding windows that cover the raster
     with rasterio.open(raster_path) as src:
