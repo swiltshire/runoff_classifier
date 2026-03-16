@@ -115,6 +115,10 @@ def main():
     local_rank = init_distributed_if_needed()
     world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
 
+    # simple startup banner; print only on rank 0
+    if is_main_process():
+        print(f"INFO [debug] starting training (world_size={world_size})")
+
     # resolve raster (rank 0), then barrier so all ranks see it
     if is_main_process():
         args.raster_path = resolve_raster_input(args.raster_path)

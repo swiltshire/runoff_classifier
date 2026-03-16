@@ -5,6 +5,7 @@ import math
 import rasterio
 from rasterio.windows import Window
 import geopandas as gpd
+from shapely.geometry import box
 
 
 def filter_windows_by_mask(
