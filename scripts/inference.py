@@ -32,7 +32,7 @@ if PROJECT_ROOT not in sys.path:
 
 from src.models.model import build_fasterrcnn_model, build_maskrcnn_model
 from src.utils.tiling import make_grid_windows, adjust_boxes_to_global
-from src.utils.fast_mask import ensure_mask_npy, load_mask_cache, filter_windows_by_mask_raster
+from src.utils.fast_mask import get_mask, filter_windows_by_mask_raster
 from src.utils.make_vrt import write_mosaic_vrt
 
 # ----------------------------
@@ -244,27 +244,17 @@ def main():
     # build full grid once, optionally filter by rasterized mask before sharding
     windows_all = make_grid_windows(args.raster_path, tile_size=args.tile_size, stride=args.stride)
     total_before = len(windows_all)
-
+    
     mask_raster = None
     if args.mask_path:
         # build or reuse mask cache
         if is_main_process():
             logger.info("[debug] rasterizing polygon mask (NHD), or fetching cached")
-
-        mask_npy = ensure_mask_npy(
-            raster_path=args.raster_path,
-            mask_path=args.mask_path,
-            cache_dir=os.path.dirname(args.raster_path),  # or a dedicated cache dir
-            all_touched=True,
-            simplify_tol_px=0.5,   # try 0.25..1.0; set 0 to disable
-            overwrite=False,
-        )
-
-        # fast load (mmap)
-        mask = load_mask_cached(mask_npy, mmap=True)
+        mask_raster = get_mask(args.raster_path, args.mask_path, cache_dir=os.path.dirname(args.raster_path), simplify_tol_px=0.5)
 
         if is_main_process():
             logger.info("[debug] filtering windows by mask raster")
+        
         windows_all = filter_windows_by_mask_raster(
             mask_raster, windows_all, min_cover_frac=max(0.0, float(args.min_cover_frac))
         )
@@ -361,7 +351,8 @@ def main():
         run_batch()
 
     # concat boxes/scores/labels and run per-rank hard nms on device
-    logger.info("[debug] concatenating boxes/scores/labels and running per-rank hard nms")
+    if is_main_process():
+        logger.info("[debug] concatenating boxes/scores/labels and running per-rank hard nms")
     device_for_nms = device if device.startswith('cuda') else 'cpu'
     boxes = torch.cat(all_boxes, dim=0).to(device_for_nms) if all_boxes else torch.empty((0, 4), device=device_for_nms)
     scores = torch.cat(all_scores, dim=0).to(device_for_nms) if all_scores else torch.empty((0,), device=device_for_nms)
@@ -430,7 +421,8 @@ def main():
             kept_masks_flat = []; kept_tile_transforms = []
 
     # vectorize to polygons (per-rank) — still needed to emit polygons, but we keep it lightweight
-    logger.info("[debug] vectorizing features to polygons")
+    if is_main_process():
+        logger.info("[debug] vectorizing features to polygons")
     geoms, class_names, score_vals = [], [], []
     with rasterio.open(args.raster_path) as src:
         crs = src.crs
@@ -485,8 +477,6 @@ def main():
 
         # fast raster mask keep-only at polygon level (no costly overlay)
         if args.mask_path:
-            # precompute mask raster (rank 0 only now)
-            mask_r = rasterize_mask_aligned(args.raster_path, args.mask_path)
             with rasterio.open(args.raster_path) as src:
                 transform = src.transform
             keep_idx = []
@@ -503,12 +493,12 @@ def main():
                 cmin, cmax = sorted([int(c0), int(c1)])
                 rmin, rmax = sorted([int(r0), int(r1)])
                 # clip to raster bounds
-                h, w = mask_r.shape
+                h, w = mask_raster.shape
                 rmin = max(0, min(h, rmin)); rmax = max(0, min(h, rmax))
                 cmin = max(0, min(w, cmin)); cmax = max(0, min(w, cmax))
                 if rmax <= rmin or cmax <= cmin:
                     continue
-                chip = mask_r[rmin:rmax, cmin:cmax]
+                chip = mask_raster[rmin:rmax, cmin:cmax]
                 cover = float(chip.sum()) / float(chip.size)
                 if cover >= min_frac and chip.sum() > 0:
                     keep_idx.append(i)
