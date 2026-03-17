@@ -4,6 +4,7 @@ import json
 import argparse
 import time
 from datetime import timedelta
+from contextlib import nullcontext
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as ddp
@@ -38,6 +39,10 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--lr', type=float, default=0.0002)
     parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--prefetch_factor', type=int, default=4,
+                        help='number of batches preloaded per worker (ignored when num_workers=0)')    
+    parser.add_argument('--grad_accum', type=int, default=1,
+                        help='micro-batches per optimizer step (accumulated gradients)')
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--classes_json', type=str, default=None)
     parser.add_argument('--save_every', type=int, default=1)
@@ -115,10 +120,6 @@ def main():
     local_rank = init_distributed_if_needed()
     world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
 
-    # simple startup banner; print only on rank 0
-    if is_main_process():
-        print(f"INFO [debug] starting training (world_size={world_size})")
-
     # resolve raster (rank 0), then barrier so all ranks see it
     if is_main_process():
         args.raster_path = resolve_raster_input(args.raster_path)
@@ -128,6 +129,9 @@ def main():
 
     # normalize labels (rank 0), then barrier
     if is_main_process():
+            # simple startup banner; print only on rank 0
+        print(f"INFO [debug] starting training (world_size={world_size})")
+        
         args.labels_path = normalize_labels_crs(
             labels_path=args.labels_path,
             raster_path=args.raster_path,
@@ -136,7 +140,7 @@ def main():
             fix_invalid=True,
             overwrite=True,
         )
-        print(f"[info] using labels: {args.labels_path}")
+        print(f"INFO [debug] using labels: {args.labels_path}")
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
@@ -182,7 +186,7 @@ def main():
     )
 
     if dist.is_available() and dist.is_initialized():
-        sampler = DistributedSampler(dataset, shuffle=True, drop_last=False)
+        sampler = DistributedSampler(dataset, shuffle=True, drop_last=True)
         shuffle = False
     else:
         sampler = None
@@ -196,9 +200,15 @@ def main():
         num_workers=args.num_workers,
         collate_fn=detection_collate_fn,
         pin_memory=True,
-        persistent_workers=True if args.num_workers > 0 else False,
-        prefetch_factor=2 if args.num_workers > 0 else None,
+        persistent_workers=(True if args.num_workers > 0 else False),
+        prefetch_factor=(args.prefetch_factor if args.num_workers > 0 else None),
     )
+
+    # print batches per rank
+    if is_main_process():
+        print(f"INFO [debug] dataloader batches per rank ≈ {len(dataloader)}")
+    rank_id = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+
 
     # device per rank
     device = args.device
@@ -226,6 +236,10 @@ def main():
     use_cuda = device.startswith("cuda")
     scaler = torch.amp.GradScaler('cuda', enabled=use_cuda)
 
+    # setup gradient accumulation
+    accum = max(1, int(args.grad_accum))
+    step_i = 0
+
     for epoch in range(1, args.epochs + 1):
         if sampler is not None:
             sampler.set_epoch(epoch)
@@ -237,13 +251,28 @@ def main():
             images = [img.to(device, non_blocking=True) for img in images]
             targets = [{k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in t.items()} for t in targets]
 
-            optimizer.zero_grad(set_to_none=True)
-            with torch.amp.autocast('cuda', enabled=use_cuda):
-                loss_dict = model(images, targets)
-                losses = sum(loss for loss in loss_dict.values()) if isinstance(loss_dict, dict) else loss_dict
-            scaler.scale(losses).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            if step_i % accum == 0:
+                optimizer.zero_grad(set_to_none=True)
+
+            # skip ddp gradient allreduce on all but the last micro-batch in this window
+            ddp_sync = ((step_i + 1) % accum == 0)
+            if hasattr(model, "no_sync") and not ddp_sync:
+                sync_ctx = model.no_sync()
+            else:
+                sync_ctx = nullcontext()
+
+            with sync_ctx:
+                with torch.amp.autocast('cuda', enabled=use_cuda):
+                    loss_dict = model(images, targets)
+                    losses = sum(loss for loss in loss_dict.values()) if isinstance(loss_dict, dict) else loss_dict
+                scaler.scale(losses / accum).backward()
+
+            if ddp_sync:
+                scaler.step(optimizer)
+                scaler.update()
+
+            step_i += 1
+
             epoch_loss_local += float(losses.detach().item())
             if is_main_process():
                 pbar.set_postfix(loss=f"{float(losses):.3f}")

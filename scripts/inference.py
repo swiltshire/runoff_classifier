@@ -32,7 +32,8 @@ if PROJECT_ROOT not in sys.path:
 
 from src.models.model import build_fasterrcnn_model, build_maskrcnn_model
 from src.utils.tiling import make_grid_windows, adjust_boxes_to_global
-from src.utils.fast_mask import rasterize_mask_aligned, filter_windows_by_mask_raster
+from src.utils.fast_mask import ensure_mask_npy, load_mask_cache, filter_windows_by_mask_raster
+from src.utils.make_vrt import write_mosaic_vrt
 
 # ----------------------------
 # helpers: logging + normalizer
@@ -63,23 +64,10 @@ def build_normalizer(norm_type: str):
         return transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     return None
 
-# -----------------------------
-# vrt resolution (cached build)
-# -----------------------------
 
-def build_vrt_from_tifs(files, out_vrt):
-    try:
-        from osgeo import gdal
-    except ImportError:
-        raise RuntimeError("python gdal (osgeo.gdal) is not installed.")
-    gdal.UseExceptions()
-    os.makedirs(os.path.dirname(out_vrt) or ".", exist_ok=True)
-    vrt = gdal.BuildVRT(out_vrt, [os.path.abspath(f) for f in files])
-    if vrt is None:
-        raise RuntimeError("gdal.BuildVRT failed to create the vrt.")
-    vrt.FlushCache()
-    vrt = None
-
+# -------------------------
+# vrt maker
+# -------------------------
 
 def resolve_raster_input(path_or_dir):
     """
@@ -96,7 +84,7 @@ def resolve_raster_input(path_or_dir):
         parent_name = os.path.basename(parent)
         out_vrt = os.path.join(parent, f"{parent_name}_mosaic.vrt")
         if not os.path.exists(out_vrt):
-            build_vrt_from_tifs(files, out_vrt)
+            write_mosaic_vrt(out_vrt, files)
         return out_vrt
     if any(ch in path_or_dir for ch in ["*", "?", "["]):
         files = sorted(glob.glob(path_or_dir))
@@ -107,7 +95,7 @@ def resolve_raster_input(path_or_dir):
         parent_name = os.path.basename(parent)
         out_vrt = os.path.join(parent, f"{parent_name}_mosaic.vrt")
         if not os.path.exists(out_vrt):
-            build_vrt_from_tifs(files, out_vrt)
+            write_mosaic_vrt(out_vrt, files)
         return out_vrt
     return path_or_dir
 
@@ -259,9 +247,24 @@ def main():
 
     mask_raster = None
     if args.mask_path:
-        # rasterize once per rank (cheap compared to model time). could be shared via disk if needed.
-        logger.info("[debug] rasterizing mask raster")
-        mask_raster = rasterize_mask_aligned(args.raster_path, args.mask_path)
+        # build or reuse mask cache
+        if is_main_process():
+            logger.info("[debug] rasterizing polygon mask (NHD), or fetching cached")
+
+        mask_npy = ensure_mask_npy(
+            raster_path=args.raster_path,
+            mask_path=args.mask_path,
+            cache_dir=os.path.dirname(args.raster_path),  # or a dedicated cache dir
+            all_touched=True,
+            simplify_tol_px=0.5,   # try 0.25..1.0; set 0 to disable
+            overwrite=False,
+        )
+
+        # fast load (mmap)
+        mask = load_mask_cached(mask_npy, mmap=True)
+
+        if is_main_process():
+            logger.info("[debug] filtering windows by mask raster")
         windows_all = filter_windows_by_mask_raster(
             mask_raster, windows_all, min_cover_frac=max(0.0, float(args.min_cover_frac))
         )
