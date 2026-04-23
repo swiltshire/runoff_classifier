@@ -1,12 +1,15 @@
 # src/utils/fast_mask.py
 from __future__ import annotations
 import os
+import json
+import time
+import logging
 import hashlib
 from typing import Optional, List
-
 import numpy as np
 import geopandas as gpd
 import rasterio
+from rasterio import features as rio_features
 from rasterio.features import rasterize
 from rasterio.windows import Window
 from shapely.geometry import box
@@ -208,29 +211,140 @@ from shapely.geometry import box
 #     return mask
 
 
+# def get_mask_clipped(
+#     raster_path: str,
+#     mask_path: str,
+#     cache_dir: str,
+#     *,
+#     downsample: int = 8,
+#     simplify_tol_px: float = 0.5,
+#     load_only: bool = False,
+# ):
+#     """
+#     AOI‑clipped, downsampled polygon mask rasterization.
+
+#     Returns
+#     -------
+#     mask : np.ndarray (uint8)
+#         Downsampled raster mask (AOI bbox only)
+#     meta : dict
+#         {
+#           "row0": int,  # AOI top‑left pixel (full‑res)
+#           "col0": int,
+#           "downsample": int,
+#         }
+#     """
+
+#     os.makedirs(cache_dir, exist_ok=True)
+
+#     base = os.path.splitext(os.path.basename(raster_path))[0]
+#     tag = f"_mask_ds{downsample}_clipped"
+#     mask_path_npy = os.path.join(cache_dir, base + tag + ".npy")
+#     meta_path_json = os.path.join(cache_dir, base + tag + ".json")
+
+#     # ---------- load cached ----------
+#     if os.path.exists(mask_path_npy) and os.path.exists(meta_path_json):
+#         mask = np.load(mask_path_npy, mmap_mode="r")
+#         with open(meta_path_json, "r") as f:
+#             meta = json.load(f)
+#         return mask, meta
+
+#     if load_only:
+#         raise FileNotFoundError("AOI‑clipped mask cache missing")
+
+#     # ---------- open raster ----------
+#     with rasterio.open(raster_path) as src:
+#         transform = src.transform
+#         crs = src.crs
+#         H, W = src.height, src.width
+
+#     # ---------- load + reproject AOI ----------
+#     gdf = gpd.read_file(mask_path)
+#     if gdf.crs != crs:
+#         gdf = gdf.to_crs(crs)
+
+#     if simplify_tol_px and simplify_tol_px > 0:
+#         gdf["geometry"] = gdf.geometry.simplify(
+#             simplify_tol_px * downsample,
+#             preserve_topology=True,
+#         )
+
+#     # ---------- union geometry ----------
+#     geom = gdf.unary_union
+#     if geom.is_empty:
+#         raise ValueError("AOI geometry is empty after union")
+
+#     # ---------- AOI bounds in pixel coords ----------
+#     minx, miny, maxx, maxy = geom.bounds
+#     inv = ~transform
+
+#     c0, r1 = inv * (minx, miny)
+#     c1, r0 = inv * (maxx, maxy)
+
+#     r0, r1 = sorted([int(r0), int(r1)])
+#     c0, c1 = sorted([int(c0), int(c1)])
+
+#     # clip to raster
+#     r0 = max(0, min(H, r0))
+#     r1 = max(0, min(H, r1))
+#     c0 = max(0, min(W, c0))
+#     c1 = max(0, min(W, c1))
+
+#     if r1 <= r0 or c1 <= c0:
+#         raise ValueError("AOI outside raster extent")
+
+#     # ---------- downsampled window ----------
+#     out_h = max(1, (r1 - r0) // downsample)
+#     out_w = max(1, (c1 - c0) // downsample)
+
+#     # adjust transform
+#     sub_transform = (
+#         transform
+#         * rasterio.Affine.translation(c0, r0)
+#         * rasterio.Affine.scale(downsample, downsample)
+#     )
+
+#     # ---------- rasterize ----------
+#     mask = rio_features.rasterize(
+#         [(geom, 1)],
+#         out_shape=(out_h, out_w),
+#         transform=sub_transform,
+#         fill=0,
+#         dtype="uint8",
+#         all_touched=False,
+#     )
+
+#     # ---------- cache ----------
+#     meta = dict(
+#         row0=int(r0),
+#         col0=int(c0),
+#         downsample=int(downsample),
+#     )
+
+#     np.save(mask_path_npy, mask)
+#     with open(meta_path_json, "w") as f:
+#         json.dump(meta, f)
+
+#     return mask, meta
+
+
+
+
+
 def get_mask_clipped(
     raster_path: str,
     mask_path: str,
     cache_dir: str,
     *,
-    downsample: int = 8,
-    simplify_tol_px: float = 0.5,
+    downsample: int = 16,
     load_only: bool = False,
 ):
     """
-    AOI‑clipped, downsampled polygon mask rasterization.
-
-    Returns
-    -------
-    mask : np.ndarray (uint8)
-        Downsampled raster mask (AOI bbox only)
-    meta : dict
-        {
-          "row0": int,  # AOI top‑left pixel (full‑res)
-          "col0": int,
-          "downsample": int,
-        }
+    AOI-clipped, downsampled polygon mask rasterization with progress logging.
     """
+
+    logger = logging.getLogger("mask_raster")
+    logger.propagate = True
 
     os.makedirs(cache_dir, exist_ok=True)
 
@@ -241,90 +355,114 @@ def get_mask_clipped(
 
     # ---------- load cached ----------
     if os.path.exists(mask_path_npy) and os.path.exists(meta_path_json):
+        logger.info("[mask] loading cached mask %s", mask_path_npy)
         mask = np.load(mask_path_npy, mmap_mode="r")
         with open(meta_path_json, "r") as f:
             meta = json.load(f)
         return mask, meta
 
     if load_only:
-        raise FileNotFoundError("AOI‑clipped mask cache missing")
+        raise FileNotFoundError(f"cached mask not found: {mask_path_npy}")
+
+    t_start = time.time()
+    logger.info("[mask] starting AOI mask build (downsample=%dx)", downsample)
 
     # ---------- open raster ----------
     with rasterio.open(raster_path) as src:
-        transform = src.transform
-        crs = src.crs
+        raster_transform = src.transform
+        raster_crs = src.crs
         H, W = src.height, src.width
 
-    # ---------- load + reproject AOI ----------
+    logger.info("[mask] raster opened (size=%dx%d)", W, H)
+
+    # ---------- load AOI polygons ----------
+    t0 = time.time()
     gdf = gpd.read_file(mask_path)
-    if gdf.crs != crs:
-        gdf = gdf.to_crs(crs)
+    logger.info("[mask] loaded %d AOI features in %.2fs", len(gdf), time.time() - t0)
 
-    if simplify_tol_px and simplify_tol_px > 0:
-        gdf["geometry"] = gdf.geometry.simplify(
-            simplify_tol_px * downsample,
-            preserve_topology=True,
-        )
+    if gdf.crs != raster_crs:
+        t0 = time.time()
+        gdf = gdf.to_crs(raster_crs)
+        logger.info("[mask] reprojected AOI to raster CRS in %.2fs", time.time() - t0)
 
-    # ---------- union geometry ----------
-    geom = gdf.unary_union
-    if geom.is_empty:
-        raise ValueError("AOI geometry is empty after union")
+    gdf = gdf[gdf.geometry.notnull() & ~gdf.geometry.is_empty]
+    logger.info("[mask] AOI features after clean: %d", len(gdf))
 
-    # ---------- AOI bounds in pixel coords ----------
-    minx, miny, maxx, maxy = geom.bounds
-    inv = ~transform
+    # ---------- AOI bounds (CHEAP, no union) ----------
+    minx, miny, maxx, maxy = gdf.total_bounds
+    inv = ~raster_transform
 
     c0, r1 = inv * (minx, miny)
     c1, r0 = inv * (maxx, maxy)
 
-    r0, r1 = sorted([int(r0), int(r1)])
-    c0, c1 = sorted([int(c0), int(c1)])
+    r0, r1 = sorted((int(r0), int(r1)))
+    c0, c1 = sorted((int(c0), int(c1)))
 
-    # clip to raster
     r0 = max(0, min(H, r0))
     r1 = max(0, min(H, r1))
     c0 = max(0, min(W, c0))
     c1 = max(0, min(W, c1))
 
-    if r1 <= r0 or c1 <= c0:
-        raise ValueError("AOI outside raster extent")
+    logger.info(
+        "[mask] AOI pixel bounds rows=(%d:%d), cols=(%d:%d)",
+        r0, r1, c0, c1
+    )
 
-    # ---------- downsampled window ----------
+    if r1 <= r0 or c1 <= c0:
+        raise ValueError("AOI lies outside raster extent")
+
+    # ---------- downsampled grid ----------
     out_h = max(1, (r1 - r0) // downsample)
     out_w = max(1, (c1 - c0) // downsample)
 
-    # adjust transform
     sub_transform = (
-        transform
+        raster_transform
         * rasterio.Affine.translation(c0, r0)
         * rasterio.Affine.scale(downsample, downsample)
     )
 
-    # ---------- rasterize ----------
+    logger.info(
+        "[mask] rasterizing AOI → grid %dx%d (downsample=%dx)",
+        out_w, out_h, downsample
+    )
+
+    # ---------- rasterization with geometry progress ----------
+    def shape_generator():
+        n = len(gdf)
+        log_every = max(1, n // 10)  # ~10 progress messages
+        for i, geom in enumerate(gdf.geometry, start=1):
+            if i % log_every == 0 or i == n:
+                logger.info("[mask] rasterizing geometry %d / %d", i, n)
+            yield (geom, 1)
+
+    t0 = time.time()
     mask = rio_features.rasterize(
-        [(geom, 1)],
+        shape_generator(),
         out_shape=(out_h, out_w),
         transform=sub_transform,
         fill=0,
         dtype="uint8",
         all_touched=False,
     )
+    logger.info("[mask] rasterization completed in %.2fs", time.time() - t0)
 
     # ---------- cache ----------
-    meta = dict(
-        row0=int(r0),
-        col0=int(c0),
-        downsample=int(downsample),
-    )
+    meta = {
+        "row0": int(r0),
+        "col0": int(c0),
+        "downsample": int(downsample),
+    }
 
     np.save(mask_path_npy, mask)
     with open(meta_path_json, "w") as f:
         json.dump(meta, f)
 
+    logger.info(
+        "[mask] cached AOI mask → %s (total time %.2fs)",
+        mask_path_npy, time.time() - t_start
+    )
+
     return mask, meta
-
-
 
 
 
