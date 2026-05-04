@@ -23,6 +23,7 @@ if PROJECT_ROOT not in sys.path:
 from src.utils.crs_utils import normalize_labels_crs
 from src.models.model import build_fasterrcnn_model, build_maskrcnn_model
 from src.data.dataset import ObjectDetectionTilesDataset, detection_collate_fn
+from src.data.sampling import StratifiedWeightedSampler
 from src.utils.tiling import make_label_centered_training_windows
 
 
@@ -46,6 +47,8 @@ def parse_args():
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
     parser.add_argument('--classes_json', type=str, default=None)
     parser.add_argument('--save_every', type=int, default=1)
+    parser.add_argument('--stratified_sampling', action='store_true',
+                        help='use stratified sampling to balance classes (recommended for multi-county)')
     return parser.parse_args()
 
 
@@ -188,6 +191,10 @@ def main():
     if dist.is_available() and dist.is_initialized():
         sampler = DistributedSampler(dataset, shuffle=True, drop_last=True)
         shuffle = False
+    elif args.stratified_sampling:
+        # use stratified sampling for single-GPU multi-county training
+        sampler = StratifiedWeightedSampler(dataset, args.labels_path, classname_field='Classname')
+        shuffle = False
     else:
         sampler = None
         shuffle = True
@@ -207,6 +214,8 @@ def main():
     # print batches per rank
     if is_main_process():
         print(f"INFO [debug] dataloader batches per rank ≈ {len(dataloader)}")
+        if args.stratified_sampling:
+            print(f"INFO [debug] using stratified sampling for balanced class representation")
     rank_id = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
 
 

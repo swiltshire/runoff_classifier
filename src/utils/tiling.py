@@ -104,8 +104,8 @@ def make_label_centered_training_windows(raster_path: str,
     grouped = gdf.groupby(classname_field)
     for cls, group in grouped:
         count = 0
-        for _, row in group.iterrows():
-            cx, cy = row.geometry.centroid.x, row.geometry.centroid.y
+        for _, label_row in group.iterrows():
+            cx, cy = label_row.geometry.centroid.x, label_row.geometry.centroid.y
             inv = ~transform
             col, row_px = inv * (cx, cy)
             # apply random jitter in pixel space
@@ -113,14 +113,14 @@ def make_label_centered_training_windows(raster_path: str,
             jy = random.randint(-jitter, jitter)
             col = int(col + jx)
             row_px = int(row_px + jy)
-            # compute top-left corner for a tile centered on (col,row)
+            # compute top-left corner for a tile centered on (col,row_px)
             col_off = max(0, min(col - tile_size // 2, width - tile_size))
             row_off = max(0, min(row_px - tile_size // 2, height - tile_size))
             windows.append(Window(col_off=col_off, row_off=row_off, width=tile_size, height=tile_size))
             count += 1
             if max_per_class is not None and count >= max_per_class:
                 break
-    # deduplicate windows
+    # deduplicate windows while preserving list
     unique = {(w.col_off, w.row_off): w for w in windows}
     return list(unique.values())
 

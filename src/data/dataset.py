@@ -68,6 +68,21 @@ class ObjectDetectionTilesDataset(Dataset):
                 gdf = gdf.to_crs(self.crs)
             self.gdf = gdf
 
+        # validate that all expected classes appear in the labels (important for multi-county data)
+        if self.classname_field in self.gdf.columns:
+            present_classes = set(self.gdf[self.classname_field].unique())
+            expected_classes = set(self.classes)
+            missing_classes = expected_classes - present_classes
+            if missing_classes:
+                print(f"WARNING: The following classes are not present in labels: {missing_classes}")
+                print(f"         Present classes: {present_classes}")
+                print(f"         This may cause training instability with multi-county data.")
+            # check if labels contain classes not in the expected list
+            unexpected_classes = present_classes - expected_classes
+            if unexpected_classes:
+                print(f"WARNING: Labels contain unexpected classes: {unexpected_classes}")
+                print(f"         These will be treated as background (class 0) and skipped.")
+
     def __len__(self) -> int:
         return len(self.tile_windows)
 
