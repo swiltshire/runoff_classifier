@@ -35,16 +35,19 @@ def _normalize_class_column(
     gdf: gpd.GeoDataFrame,
     county: str,
 ) -> gpd.GeoDataFrame:
-    class_cols = [c for c in ("Classname", "Class") if c in gdf.columns]
+    class_cols = [c for c in ("Classname", "classname", "Class") if c in gdf.columns]
 
     if len(class_cols) == 0:
-        _fail(f"{county}: missing class column (expected 'Classname' or 'Class')")
+        _fail(f"{county}: missing class column (expected 'Classname', 'classname', or 'Class')")
 
     if len(class_cols) > 1:
-        _fail(f"{county}: both 'Classname' and 'Class' present — ambiguous schema")
+        _fail(f"{county}: multiple class name fields present — ambiguous schema")
 
     if class_cols[0] == "Class":
         gdf = gdf.rename(columns={"Class": "Classname"})
+    
+    if class_cols[0] == "classname":
+        gdf = gdf.rename(columns={"classname": "Classname"})
 
     # defensive cleanup
     gdf["Classname"] = gdf["Classname"].astype(str).str.strip()

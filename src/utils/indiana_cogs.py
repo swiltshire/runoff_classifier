@@ -67,6 +67,35 @@ def head_length(session: requests.Session, url: str) -> Optional[int]:
         pass
     return None
 
+def is_valid_tiff_header(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            sig = f.read(4)
+        return sig in (b"II*\x00", b"MM\x00*")
+    except:
+        return False
+
+
+def matches_remote_size(path: Path, remote_size: Optional[int]) -> bool:
+    if remote_size is None:
+        return True  # can't verify
+    try:
+        return path.stat().st_size == remote_size
+    except:
+        return False
+
+
+def has_raster_data(path: Path) -> bool:
+    """optional deeper check: ensure not empty"""
+    try:
+        import rasterio
+        with rasterio.open(path) as ds:
+            # read small window for speed
+            arr = ds.read(1, window=((0, min(256, ds.height)), (0, min(256, ds.width))))
+            return arr.max() != arr.min()
+    except:
+        return False
+
 
 # ---------------- FeatureServer queries ----------------
 
@@ -116,40 +145,81 @@ def download_one(url: str, dest: Path, session: requests.Session) -> str:
     ensure_dir(dest.parent)
 
     remote = head_length(session, url)
-    local = dest.stat().st_size if dest.exists() else 0
 
-    # skip
-    if remote is not None and local == remote:
-        return "skipped"
+    # if file exists, validate it
+    if dest.exists():
+        if matches_remote_size(dest, remote) and is_valid_tiff_header(dest):
+            return "skipped"
+        else:
+            dest.unlink(missing_ok=True)
 
-    # try resume
-    if local > 0 and remote and local < remote:
-        headers = {"Range": f"bytes={local}-"}
-        try:
-            with session.get(url, headers=headers, stream=True, timeout=60) as r:
-                if r.status_code == 206:
-                    mode = "ab"
-                    label = "resumed"
-                else:
-                    mode = "wb"
-                    label = "downloaded"
+    # download fresh
+    try:
+        with session.get(url, stream=True, timeout=(10, 300)) as r:
+            r.raise_for_status()
 
-                with open(dest, mode) as f:
-                    for chunk in r.iter_content(4*1024*1024):
-                        if chunk:
-                            f.write(chunk)
-                return label
-        except:
-            pass
+            content_type = r.headers.get("content-type", "").lower()
+            if "tif" not in content_type and "image" not in content_type:
+                raise RuntimeError(f"not a tif: {content_type}")
 
-    # fresh download
-    with session.get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(4*1024*1024):
-                if chunk:
-                    f.write(chunk)
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(4 * 1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+
+    except Exception:
+        dest.unlink(missing_ok=True)
+        return "failed"
+
+    # validate after download
+    if not matches_remote_size(dest, remote):
+        dest.unlink(missing_ok=True)
+        return "failed"
+
+    if not is_valid_tiff_header(dest):
+        dest.unlink(missing_ok=True)
+        return "failed"
+
     return "downloaded"
+
+# def download_one(url: str, dest: Path, session: requests.Session) -> str:
+#     ensure_dir(dest.parent)
+
+#     remote = head_length(session, url)
+#     local = dest.stat().st_size if dest.exists() else 0
+
+#     # skip
+#     if remote is not None and local == remote:
+#         return "skipped"
+
+#     # try resume
+#     if local > 0 and remote and local < remote:
+#         headers = {"Range": f"bytes={local}-"}
+#         try:
+#             with session.get(url, headers=headers, stream=True, timeout=60) as r:
+#                 if r.status_code == 206:
+#                     mode = "ab"
+#                     label = "resumed"
+#                 else:
+#                     mode = "wb"
+#                     label = "downloaded"
+
+#                 with open(dest, mode) as f:
+#                     for chunk in r.iter_content(4*1024*1024):
+#                         if chunk:
+#                             f.write(chunk)
+#                 return label
+#         except:
+#             pass
+
+#     # fresh download
+#     with session.get(url, stream=True, timeout=60) as r:
+#         r.raise_for_status()
+#         with open(dest, "wb") as f:
+#             for chunk in r.iter_content(4*1024*1024):
+#                 if chunk:
+#                     f.write(chunk)
+#     return "downloaded"
 
 
 # ---------------- public api ----------------
@@ -202,7 +272,7 @@ def download_6in_tiles(county: str, max_workers: int = 16) -> Dict:
             futures = [pool.submit(download_one, url, dest, s) for url, dest in jobs]
             for fut in as_completed(futures):
                 try:
-                    res = fut.result()
+                    res = fut.result(timeout=120)
                     if res == "downloaded": downloaded += 1
                     elif res == "resumed": resumed += 1
                     elif res == "skipped": skipped += 1
