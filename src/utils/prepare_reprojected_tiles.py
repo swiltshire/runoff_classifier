@@ -147,6 +147,7 @@ def ensure_canonical_tiles_for_county(
     *,
     force: bool = False,
     max_workers: int = 16,
+    cleanup: bool = False,
 ):
     start = time.time()
     county_safe = safe_name(county)
@@ -207,12 +208,23 @@ def ensure_canonical_tiles_for_county(
         f"elapsed={elapsed}"
     )
 
+    # 2. optionally cleanup local tiles
+    if cleanup:
+        # import shutil
+        import subprocess
+        output_dir = Path(info["output_dir"])
+        log(f"  Cleaning up local tiles in {output_dir}")
+        # shutil.rmtree(output_dir) # this was VERY slow
+        subprocess.run(["rm", "-rf", output_dir], check=True) # use os-native deletion
+        log(f"  ✓ Deleted {len(local_tiles)} tiles ({output_dir})")
+
 def ensure_canonical_tiles_for_counties(
     counties: List[str],
     *,
     force: bool = False,
+    cleanup: bool = False,
 ):
-    log(f"Preparing canonical tiles for {len(counties)} counties")
+    log(f"Preparing canonical tiles for {len(counties)} counties (cleanup={cleanup})")
     for county in counties:
-        ensure_canonical_tiles_for_county(county, force=force)
+        ensure_canonical_tiles_for_county(county, force=force, cleanup=cleanup)
     log("All requested counties processed")
