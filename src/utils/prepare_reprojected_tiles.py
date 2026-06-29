@@ -60,7 +60,8 @@ def s3_exists(bucket: str, key: str) -> bool:
     try:
         s3.head_object(Bucket=bucket, Key=key)
         return True
-    except s3.exceptions.ClientError:
+    except (s3.exceptions.ClientError, Exception):
+        # Catch ClientError (404, etc) and connection errors
         return False
 
 def upload_to_s3(local_path: Path, bucket: str, key: str):
@@ -99,7 +100,10 @@ def gdal_reproject(src: Path, dst: Path):
         str(dst),
     ]
 
-    subprocess.check_call(cmd)
+    try:
+        subprocess.check_call(cmd)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"gdalwarp failed: {e}")
 
 # ---------------------------------------------------------------------
 # Parallel worker (must be top-level)

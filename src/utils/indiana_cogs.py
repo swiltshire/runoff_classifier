@@ -63,37 +63,42 @@ def head_length(session: requests.Session, url: str) -> Optional[int]:
         if r.ok:
             cl = r.headers.get("content-length")
             return int(cl) if cl else None
-    except:
+    except (requests.RequestException, ValueError):
         pass
     return None
 
+
+# ---------------- defensive validation ----------------
+
 def is_valid_tiff_header(path: Path) -> bool:
+    """Check if file has valid TIFF header."""
     try:
         with open(path, "rb") as f:
             sig = f.read(4)
         return sig in (b"II*\x00", b"MM\x00*")
-    except:
+    except (IOError, OSError):
         return False
 
 
 def matches_remote_size(path: Path, remote_size: Optional[int]) -> bool:
+    """Verify local file matches remote size."""
     if remote_size is None:
         return True  # can't verify
     try:
         return path.stat().st_size == remote_size
-    except:
+    except (IOError, OSError):
         return False
 
 
 def has_raster_data(path: Path) -> bool:
-    """optional deeper check: ensure not empty"""
+    """Ensure file contains actual raster data (not empty/corrupted)."""
     try:
         import rasterio
         with rasterio.open(path) as ds:
             # read small window for speed
             arr = ds.read(1, window=((0, min(256, ds.height)), (0, min(256, ds.width))))
             return arr.max() != arr.min()
-    except:
+    except Exception:
         return False
 
 
@@ -201,7 +206,7 @@ def download_one(url: str, dest: Path, session: requests.Session) -> str:
                     if chunk:
                         f.write(chunk)
 
-    except Exception:
+    except (requests.RequestException, OSError, RuntimeError):
         dest.unlink(missing_ok=True)
         return "failed"
 
@@ -215,45 +220,6 @@ def download_one(url: str, dest: Path, session: requests.Session) -> str:
         return "failed"
 
     return "downloaded"
-
-# def download_one(url: str, dest: Path, session: requests.Session) -> str:
-#     ensure_dir(dest.parent)
-
-#     remote = head_length(session, url)
-#     local = dest.stat().st_size if dest.exists() else 0
-
-#     # skip
-#     if remote is not None and local == remote:
-#         return "skipped"
-
-#     # try resume
-#     if local > 0 and remote and local < remote:
-#         headers = {"Range": f"bytes={local}-"}
-#         try:
-#             with session.get(url, headers=headers, stream=True, timeout=60) as r:
-#                 if r.status_code == 206:
-#                     mode = "ab"
-#                     label = "resumed"
-#                 else:
-#                     mode = "wb"
-#                     label = "downloaded"
-
-#                 with open(dest, mode) as f:
-#                     for chunk in r.iter_content(4*1024*1024):
-#                         if chunk:
-#                             f.write(chunk)
-#                 return label
-#         except:
-#             pass
-
-#     # fresh download
-#     with session.get(url, stream=True, timeout=60) as r:
-#         r.raise_for_status()
-#         with open(dest, "wb") as f:
-#             for chunk in r.iter_content(4*1024*1024):
-#                 if chunk:
-#                     f.write(chunk)
-#     return "downloaded"
 
 
 # ---------------- public api ----------------

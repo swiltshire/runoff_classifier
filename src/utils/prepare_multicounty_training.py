@@ -23,11 +23,13 @@ from utils.make_vrt import write_mosaic_vrt
 # Helpers
 # -----------------------------------------------------------------------------
 
-def _log(msg: str):
+def _log(msg: str) -> None:
+    """Log message with prepare prefix."""
     print(f"[prepare] {msg}", flush=True)
 
 
-def _fail(msg: str):
+def _fail(msg: str) -> None:
+    """Raise a fatal error with prepare prefix."""
     raise RuntimeError(f"[prepare][FATAL] {msg}")
 
 
@@ -35,6 +37,7 @@ def _normalize_class_column(
     gdf: gpd.GeoDataFrame,
     county: str,
 ) -> gpd.GeoDataFrame:
+    """Normalize class column naming across counties."""
     class_cols = [c for c in ("Classname", "classname", "Class") if c in gdf.columns]
 
     if len(class_cols) == 0:
@@ -56,15 +59,18 @@ def _normalize_class_column(
 
 
 def _raster_bounds(raster_path: str) -> BoundingBox:
+    """Get bounds from a raster file."""
     with rasterio.open(raster_path) as ds:
         return ds.bounds
 
 
 def _bounds_intersect(a: BoundingBox, b: BoundingBox) -> bool:
+    """Check if two bounding boxes intersect."""
     return box(*a).intersects(box(*b))
 
 
-def _plot_overlay(raster_path: str, gdf: gpd.GeoDataFrame, title: str):
+def _plot_overlay(raster_path: str, gdf: gpd.GeoDataFrame, title: str) -> None:
+    """Plot raster with label overlays for debugging."""
     with rasterio.open(raster_path) as ds:
         img = ds.read([1, 2, 3])
         transform = ds.transform
@@ -89,7 +95,7 @@ def prepare_multicounty_training(
     *,
     verified_only: bool = True,
     debug_plots: bool = False,
-):
+) -> None:
     """
     Prepare a multi-county training dataset:
       - merge shapefiles
