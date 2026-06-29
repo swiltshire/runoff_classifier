@@ -68,6 +68,40 @@ def head_length(session: requests.Session, url: str) -> Optional[int]:
     return None
 
 
+# ---------------- defensive validation ----------------
+
+def is_valid_tiff_header(path: Path) -> bool:
+    """Check if file has valid TIFF header."""
+    try:
+        with open(path, "rb") as f:
+            sig = f.read(4)
+        return sig in (b"II*\x00", b"MM\x00*")
+    except:
+        return False
+
+
+def matches_remote_size(path: Path, remote_size: Optional[int]) -> bool:
+    """Verify local file matches remote size."""
+    if remote_size is None:
+        return True  # can't verify
+    try:
+        return path.stat().st_size == remote_size
+    except:
+        return False
+
+
+def has_raster_data(path: Path) -> bool:
+    """Ensure file contains actual raster data (not empty/corrupted)."""
+    try:
+        import rasterio
+        with rasterio.open(path) as ds:
+            # read small window for speed
+            arr = ds.read(1, window=((0, min(256, ds.height)), (0, min(256, ds.width))))
+            return arr.max() != arr.min()
+    except:
+        return False
+
+
 # ---------------- FeatureServer queries ----------------
 
 def get_layers(session: requests.Session) -> List[Tuple[int,int,str]]:
