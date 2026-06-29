@@ -198,6 +198,11 @@ cython_debug/
 # Abstra
 #   Abstra is an AI-powered process automation framework.
 #   Ignore directories containing user credentials, local state, and settings.
+
+# Visual Studio
+.vs/
+*.sln
+*.slnx
 #   Learn more at https://abstra.io/docs
 .abstra/
 
