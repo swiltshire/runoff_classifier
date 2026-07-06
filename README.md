@@ -182,8 +182,19 @@ python -m torch.distributed.run --nproc_per_node=4 scripts/train.py \
 - Class definitions: `outputs/train_multicounty/classes.json`
 - Training logs (stdout)
 
-### 4. Inference
+### 4. Inference on Multiple Counties
 
+Inference can be run on one or more counties. The notebook provides:
+1. County selection widget (select single or multiple counties)
+2. Parameter configuration (tile size, score threshold, etc.)
+3. Automatic loop that runs inference sequentially on each selected county
+
+**In notebook:**
+1. Select counties in "Select counties for inference" widget
+2. Review parameters in "Setup inference parameters" cell
+3. Run "Run inference on selected counties" cell — outputs saved to `outputs/train_multicounty/inferences_{county}/detections.gpkg` for each county
+
+**Command-line (single county):**
 ```bash
 python -m torch.distributed.run --nproc_per_node=4 scripts/inference.py \
     --task instance_seg \
@@ -192,11 +203,24 @@ python -m torch.distributed.run --nproc_per_node=4 scripts/inference.py \
     --out_vector "outputs/inferences_Benton/detections.gpkg" \
     --tile_size 512 \
     --score_thresh 0.2 \
-    --mask_path "data/NHDmask_Indiana/NHDfinalMaskIndiana.shp"
+    --normalize imagenet \
+    --nms_iou_thresh 0.3 \
+    --mask_path "data/NHDmask_Indiana/NHDfinalMaskIndiana.shp" \
+    --min_cover_frac 0.01 \
+    --class_area_csv "data/feature_size_threshholds.csv"
 ```
 
-**Outputs:**
-- GeoPackage with predictions: `classname`, `score`, geometry
+**Key Parameters:**
+- `--score_thresh`: Confidence threshold (0.2 typical)
+- `--nms_iou_thresh`: NMS overlap threshold (0.3 typical)
+- `--min_cover_frac`: Minimum fraction of mask coverage (0.01 = 1%)
+- `--stride`: Window stride (512//2 = 50% overlap)
+- `--infer_batch`: Batch size for inference (5 typical)
+
+**Outputs (per county):**
+- GeoPackage: `outputs/train_multicounty/inferences_{county}/detections.gpkg`
+  - Columns: `classname`, `score`, `geometry`
+  - Geometries clipped to valid areas (NHD mask + size filters applied)
 
 ---
 
