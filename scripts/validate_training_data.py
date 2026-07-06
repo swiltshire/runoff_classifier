@@ -175,7 +175,8 @@ def validate_training_data(
             warnings.append(f"{cls} only {pct:.1f}% - might be under-represented")
             if verbose:
                 _log(f"⚠ {cls}: only {pct:.1f}% of data", "WARN")
-        if pct > 60:
+        # Skip Background class check - expected to be high from negative examples
+        if pct > 60 and cls != 'Background':
             warnings.append(f"{cls} {pct:.1f}% - might indicate data poison")
             if verbose:
                 _log(f"⚠ {cls}: {pct:.1f}% (check for poisoned counties!)", "WARN")
