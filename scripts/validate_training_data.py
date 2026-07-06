@@ -170,16 +170,18 @@ def validate_training_data(
 
     # Detect extreme imbalances (potential data poison)
     for cls, count in class_dist.items():
+        # Skip Background - expected to be high from negative examples, handled during training
+        if cls == 'Background':
+            continue
         pct = 100 * count / total
         if pct < 5:
             warnings.append(f"{cls} only {pct:.1f}% - might be under-represented")
             if verbose:
-                _log(f"{cls}: only {pct:.1f}% of data", "WARN")
-        # Skip Background class check - expected to be high from negative examples
-        if pct > 60 and cls != 'Background':
+                _log(f"⚠ {cls}: only {pct:.1f}% of data", "WARN")
+        if pct > 60:
             warnings.append(f"{cls} {pct:.1f}% - might indicate data poison")
             if verbose:
-                _log(f"{cls}: {pct:.1f}% - check county distributions", "WARN")
+                _log(f"⚠ {cls}: {pct:.1f}% (check for poisoned counties!)", "WARN")
 
     summary["class_distribution"] = class_dist.to_dict()
 
