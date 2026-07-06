@@ -174,12 +174,12 @@ def validate_training_data(
         if pct < 5:
             warnings.append(f"{cls} only {pct:.1f}% - might be under-represented")
             if verbose:
-                _log(f"⚠ {cls}: only {pct:.1f}% of data", "WARN")
+                _log(f"{cls}: only {pct:.1f}% of data", "WARN")
         # Skip Background class check - expected to be high from negative examples
         if pct > 60 and cls != 'Background':
             warnings.append(f"{cls} {pct:.1f}% - might indicate data poison")
             if verbose:
-                _log(f"⚠ {cls}: {pct:.1f}% (check for poisoned counties!)", "WARN")
+                _log(f"{cls}: {pct:.1f}% - check county distributions", "WARN")
 
     summary["class_distribution"] = class_dist.to_dict()
 
