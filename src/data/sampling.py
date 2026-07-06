@@ -4,8 +4,12 @@ Ensures balanced class representation across counties.
 """
 
 import numpy as np
-from torch.utils.data import WeightedRandomSampler, Sampler
+from torch.utils.data import Sampler
 import torch
+import geopandas as gpd
+from collections import defaultdict
+from shapely.geometry import box
+import rasterio
 
 
 class StratifiedWeightedSampler(Sampler):
@@ -27,11 +31,6 @@ class StratifiedWeightedSampler(Sampler):
         replacement : bool
             Whether to sample with replacement
         """
-        import geopandas as gpd
-        from collections import defaultdict
-        from rasterio.windows import Window
-        import rasterio
-
         self.dataset = dataset
         self.replacement = replacement
 
@@ -46,7 +45,6 @@ class StratifiedWeightedSampler(Sampler):
             # Get world bounds for this window
             minx, miny = transform * (window.col_off, window.row_off)
             maxx, maxy = transform * (window.col_off + window.width, window.row_off + window.height)
-            from shapely.geometry import box
             window_geom = box(min(minx, maxx), min(miny, maxy), max(minx, maxx), max(miny, maxy))
 
             # Find intersecting labels
@@ -88,30 +86,3 @@ class StratifiedWeightedSampler(Sampler):
 
     def __len__(self):
         return len(self.dataset)
-
-
-def compute_class_weights(labels_path: str, classes: list, classname_field: str = 'Classname') -> dict:
-    """
-    Compute class weights for balanced loss, accounting for multi-county imbalance.
-    Returns dict: class_name -> weight
-    """
-    import geopandas as gpd
-    from collections import Counter
-
-    gdf = gpd.read_file(labels_path)
-    class_counts = Counter(gdf[classname_field])
-
-    # Classes with no labels get default weight of 1.0
-    weights = {}
-    if class_counts:
-        max_count = max(class_counts.values())
-        for cls in classes:
-            count = class_counts.get(cls, 0)
-            if count > 0:
-                weights[cls] = max_count / count
-            else:
-                weights[cls] = 1.0  # or could be higher to encourage learning
-    else:
-        weights = {cls: 1.0 for cls in classes}
-
-    return weights

@@ -8,10 +8,7 @@ Run this after prepare_multicounty_training() to catch data quality issues.
 import sys
 import os
 import argparse
-from pathlib import Path
 
-import numpy as np
-import pandas as pd
 import geopandas as gpd
 import rasterio
 

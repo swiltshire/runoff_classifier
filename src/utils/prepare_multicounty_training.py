@@ -1,11 +1,10 @@
-# scripts/prepare_multicounty_training.py
+# src/utils/prepare_multicounty_training.py
 
 import os
 import sys
 import glob
-import json
 from pathlib import Path
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 import geopandas as gpd
 import pandas as pd
