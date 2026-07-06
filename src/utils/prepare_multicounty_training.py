@@ -182,8 +182,18 @@ def prepare_multicounty_training(
         # Normalize class column title
         gdf = _normalize_class_column(gdf, county=c)
 
+        # Handle verified labels: keep both positive and negative examples
         if verified_only and "VerifiedTr" in gdf.columns:
-            gdf = gdf[gdf["VerifiedTr"] == 1]
+            # Keep rows where VerifiedTr is 0 (negative) or 1 (positive)
+            gdf = gdf[gdf["VerifiedTr"].isin([0, 1])]
+            
+            # Assign "Background" class to negative examples (VerifiedTr == 0)
+            gdf.loc[gdf["VerifiedTr"] == 0, "Classname"] = "Background"
+            
+            # Log class distribution for this county
+            n_positives = (gdf["VerifiedTr"] == 1).sum()
+            n_negatives = (gdf["VerifiedTr"] == 0).sum()
+            _log(f"  {c}: {n_positives} positive examples, {n_negatives} negative (Background) examples")
 
         if gdf.empty:
             _log(f"WARNING: {c} has zero usable labels")
