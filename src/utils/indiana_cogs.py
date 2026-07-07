@@ -155,6 +155,44 @@ def county_where(county: str) -> str:
     return f"UPPER(county) LIKE '%{c}%'"
 
 
+def fetch_all_indiana_counties(session: requests.Session) -> List[str]:
+    """Query Indiana feature server for all available counties.
+    
+    Uses the most recent Footprint_YYYY layer and returns sorted county names.
+    This is the canonical source for valid Indiana counties.
+    """
+    layers = get_layers(session)
+    if not layers:
+        raise RuntimeError("No Footprint_YYYY layers found on feature server")
+    
+    # Use the newest layer
+    year, layer_id, layer_name = layers[0]
+    layer_url = f"{SERVICE_URL}/{layer_id}"
+    
+    # Query for all distinct county values
+    params = {
+        "where": "1=1",  # select all
+        "outFields": "county",
+        "returnDistinctValues": True,
+        "f": "json"
+    }
+    r = session.get(f"{layer_url}/query", params=params, timeout=60)
+    r.raise_for_status()
+    js = r.json()
+    
+    # Extract and clean county names
+    counties = sorted(set([
+        feat["attributes"]["county"].strip().title()
+        for feat in js.get("features", [])
+        if "attributes" in feat and "county" in feat["attributes"]
+    ]))
+    
+    if not counties:
+        raise RuntimeError(f"Feature server returned no counties from layer {layer_name}")
+    
+    return counties
+
+
 def fetch_attrs(session: requests.Session, layer_url: str, where: str) -> List[Dict]:
     out = []
     offset = 0
