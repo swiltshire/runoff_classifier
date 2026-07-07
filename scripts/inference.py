@@ -520,9 +520,9 @@ def main():
     out_dir = os.path.dirname(args.out_vector) or "."
     os.makedirs(out_dir, exist_ok=True)
     
-    # Extract layer name from output filename (e.g., detections_Benton_20260707_145300 from detections_Benton_20260707_145300.gpkg)
+    # Extract filename for output (e.g., detections_Benton_20260707_145300 from detections_Benton_20260707_145300.gpkg)
     base, ext = os.path.splitext(os.path.basename(args.out_vector))
-    layer_name = base  # Use filename without extension as layer name
+    layer_name = "detections"  # Keep layer name simple for ArcGIS Pro compatibility
     
     partial_path = os.path.join(out_dir, f"{base}_rank{rank}{ext if ext.lower()=='.gpkg' else '.gpkg'}")
     gdf.to_file(partial_path, driver="GPKG", layer=layer_name)
