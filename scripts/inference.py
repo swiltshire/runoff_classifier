@@ -533,11 +533,16 @@ def main():
     if is_main_process():
         import pandas as pd
         parts = [os.path.join(out_dir, f"{base}_rank{r}{ext if ext.lower()=='.gpkg' else '.gpkg'}") for r in range(world_size)]
+        logger.info("[debug] looking for rank files in: %s", out_dir)
+        logger.info("[debug] rank file paths: %s", parts)
         gdfs = []
         for p in parts:
-            if os.path.exists(p):
+            exists = os.path.exists(p)
+            logger.info("[debug] checking %s: %s", p, "exists" if exists else "NOT FOUND")
+            if exists:
                 try:
                     gdfs.append(gpd.read_file(p, layer=layer_name))
+                    logger.info("[debug] read %s: %d features", p, len(gdfs[-1]))
                 except Exception:
                     logger.exception("[warn] failed reading %s; skipping", p)
         if len(gdfs) > 0:
