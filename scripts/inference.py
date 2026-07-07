@@ -39,7 +39,7 @@ from src.utils.make_vrt import write_mosaic_vrt
 # configuration
 # ---------------------------
 
-MASK_DOWNSAMPLE = 1  # recommended for 6-inch imagery
+MASK_DOWNSAMPLE = 16  # downsample AOI mask for faster loading
 
 # ----------------------------
 # helpers: logging + normalizer
