@@ -524,7 +524,7 @@ def main():
     base, ext = os.path.splitext(os.path.basename(args.out_vector))
     layer_name = base  # Use filename without extension as layer name
     
-    partial_path = f"{os.path.dirname(args.out_vector)}/{base}_rank{rank}{ext if ext.lower()=='.gpkg' else '.gpkg'}"
+    partial_path = os.path.join(out_dir, f"{base}_rank{rank}{ext if ext.lower()=='.gpkg' else '.gpkg'}")
     gdf.to_file(partial_path, driver="GPKG", layer=layer_name)
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
@@ -532,7 +532,7 @@ def main():
     # rank 0: merge, enforce mask via raster (fast), final box-nms dedupe, area filter, write final
     if is_main_process():
         import pandas as pd
-        parts = [f"{base}_rank{r}{ext if ext.lower()=='.gpkg' else '.gpkg'}" for r in range(world_size)]
+        parts = [os.path.join(out_dir, f"{base}_rank{r}{ext if ext.lower()=='.gpkg' else '.gpkg'}") for r in range(world_size)]
         gdfs = []
         for p in parts:
             if os.path.exists(p):
@@ -663,7 +663,7 @@ def main():
         logger.info("[debug] final area thresholding kept %d features (dropped %d under or over size threshhold)",
             post_count, pre_count - post_count)
 
-        final_path = args.out_vector if args.out_vector.lower().endswith('.gpkg') else base + '.gpkg'
+        final_path = args.out_vector if args.out_vector.lower().endswith('.gpkg') else os.path.join(out_dir, base + '.gpkg')
         os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
         merged.to_file(final_path, driver="GPKG", layer=layer_name)
         logger.info("[done] wrote %d features → %s (elapsed %.2fs)",
