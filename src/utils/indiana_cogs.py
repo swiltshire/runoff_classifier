@@ -158,8 +158,9 @@ def county_where(county: str) -> str:
 def fetch_all_indiana_counties(session: requests.Session) -> List[str]:
     """Query Indiana feature server for all available counties.
     
-    Uses the most recent Footprint_YYYY layer and returns sorted county names.
-    This is the canonical source for valid Indiana counties.
+    Uses the most recent Footprint_YYYY layer and extracts individual county names
+    from multi-county coverage regions. Returns sorted, deduplicated county names.
+    This is the canonical source for valid Indiana counties with available tiles.
     """
     layers = get_layers(session)
     if not layers:
@@ -180,17 +181,20 @@ def fetch_all_indiana_counties(session: requests.Session) -> List[str]:
     r.raise_for_status()
     js = r.json()
     
-    # Extract and clean county names
-    counties = sorted(set([
-        feat["attributes"]["county"].strip().title()
-        for feat in js.get("features", [])
-        if "attributes" in feat and "county" in feat["attributes"]
-    ]))
+    # Extract individual county names from multi-county coverage regions
+    # Feature server returns comma-separated region strings like "Bartholomew, Brown, Jackson"
+    all_counties = set()
+    for feat in js.get("features", []):
+        if "attributes" in feat and "county" in feat["attributes"]:
+            region = feat["attributes"]["county"].strip()
+            # Split on comma and clean each county name
+            county_names = [c.strip().title() for c in region.split(",")]
+            all_counties.update(county_names)
     
-    if not counties:
+    if not all_counties:
         raise RuntimeError(f"Feature server returned no counties from layer {layer_name}")
     
-    return counties
+    return sorted(all_counties)
 
 
 def fetch_attrs(session: requests.Session, layer_url: str, where: str) -> List[Dict]:
