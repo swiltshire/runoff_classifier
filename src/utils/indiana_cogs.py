@@ -136,6 +136,64 @@ def has_raster_data(path: Path) -> bool:
         return False
 
 
+# ----------- diagnostics for imagery metadata -----------
+
+def inspect_layer_metadata(session: requests.Session, year: int = None) -> Dict:
+    """Inspect available fields and sample tile attributes.
+    
+    Use this to understand what metadata is available for imagery (capture date, season, etc).
+    
+    Returns dict with:
+      - fields: list of all available field names in the layer
+      - sample_attributes: first tile's attributes (to see what data looks like)
+      - sample_url: example URL from the layer
+    """
+    layers = get_layers(session)
+    if not layers:
+        raise RuntimeError("No Footprint_YYYY layers found")
+    
+    # Use specified year or newest
+    if year:
+        matching = [l for l in layers if l[0] == year]
+        if not matching:
+            raise RuntimeError(f"No layer for year {year}. Available: {[l[0] for l in layers]}")
+        layer_year, layer_id, layer_name = matching[0]
+    else:
+        layer_year, layer_id, layer_name = layers[0]
+    
+    layer_url = f"{SERVICE_URL}/{layer_id}"
+    
+    # Get layer info to see available fields
+    r = session.get(f"{layer_url}", params={"f": "json"}, timeout=30)
+    r.raise_for_status()
+    layer_info = r.json()
+    
+    fields = [f["name"] for f in layer_info.get("fields", [])]
+    
+    # Query one feature with ALL fields to see what metadata exists
+    params = {
+        "where": "1=1",
+        "outFields": "*",  # all fields
+        "returnGeometry": False,
+        "resultRecordCount": 1,
+        "f": "json"
+    }
+    r = session.get(f"{layer_url}/query", params=params, timeout=60)
+    r.raise_for_status()
+    js = r.json()
+    
+    sample_attrs = js.get("features", [{}])[0].get("attributes", {})
+    
+    return {
+        "layer": layer_name,
+        "year": layer_year,
+        "available_fields": fields,
+        "sample_attributes": sample_attrs,
+        "field_count": len(fields),
+        "attribute_count": len(sample_attrs)
+    }
+
+
 # ---------------- FeatureServer queries ----------------
 
 def get_layers(session: requests.Session) -> List[Tuple[int,int,str]]:

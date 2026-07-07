@@ -519,9 +519,12 @@ def main():
     # write per-rank partial (no heavy geopandas processing here)
     out_dir = os.path.dirname(args.out_vector) or "."
     os.makedirs(out_dir, exist_ok=True)
-    layer_name = "detections"
-    base, ext = os.path.splitext(args.out_vector)
-    partial_path = f"{base}_rank{rank}{ext if ext.lower()=='.gpkg' else '.gpkg'}"
+    
+    # Extract layer name from output filename (e.g., detections_Benton_20260707_145300 from detections_Benton_20260707_145300.gpkg)
+    base, ext = os.path.splitext(os.path.basename(args.out_vector))
+    layer_name = base  # Use filename without extension as layer name
+    
+    partial_path = f"{os.path.dirname(args.out_vector)}/{base}_rank{rank}{ext if ext.lower()=='.gpkg' else '.gpkg'}"
     gdf.to_file(partial_path, driver="GPKG", layer=layer_name)
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
