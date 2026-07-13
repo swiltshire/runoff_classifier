@@ -245,43 +245,26 @@ def build_county_metadata_table(
     if not layers:
         raise RuntimeError("No Footprint_YYYY layers found")
     
-    # Loop through layers (newest first) until we find one with 6-inch tiles
-    # This matches the logic in download_6in_tiles()
-    layer_info = None
-    for year, layer_id, layer_name in layers:
-        test_url = f"{SERVICE_URL}/{layer_id}"
-        # Check first 3 counties to see if this layer has 6-inch tiles
-        has_6in = False
-        for test_county in list(counties)[:3]:
-            test_attrs = fetch_attrs(session, test_url, county_where(test_county))
-            if any(a.get("pixel_size", "") in ("06 in.",) for a in test_attrs):
-                has_6in = True
-                print(f"  Found 6-in tiles in {layer_name}")
-                break
-        if has_6in:
-            layer_info = (year, layer_id, layer_name)
-            break
-        else:
-            print(f"  {layer_name}: No 6-in tiles in sample")
-    
-    if not layer_info:
-        raise RuntimeError("No layers with 6-inch tiles found")
-    
-    year, layer_id, layer_name = layer_info
-    layer_url = f"{SERVICE_URL}/{layer_id}"
-    
     results = []
     
-    print(f"\n[Metadata] Using {layer_name} (year {year}) - 6-inch tiles detected")
-    print(f"[Metadata] Querying {len(counties)} counties...")
+    print(f"\n[Metadata] Querying {len(counties)} counties (finding best layer per county)...")
     
     for county in tqdm(counties, desc="Counties processed", unit="county"):
         try:
-            # Use fetch_attrs for consistent feature server query (same as download_6in_tiles)
-            attrs_list = fetch_attrs(session, layer_url, county_where(county))
+            # Find newest layer with 6-inch tiles for THIS county
+            # (matches download_6in_tiles logic - per-county layer selection)
+            layer_info = None
+            for year, layer_id, layer_name in layers:
+                test_url = f"{SERVICE_URL}/{layer_id}"
+                attrs_list = fetch_attrs(session, test_url, county_where(county))
+                
+                # Check if this layer has 6-in tiles for this county
+                if any(a.get("pixel_size", "") in ("06 in.",) for a in attrs_list):
+                    layer_info = (year, layer_id, layer_name, test_url, attrs_list)
+                    break
             
-            if not attrs_list:
-                print(f"  ⚠ {county}: No tiles found")
+            if not layer_info:
+                print(f"  ⚠ {county}: No layers with 6-inch tiles found")
                 results.append({
                     "county": county,
                     "capture_dates": [],
@@ -290,9 +273,11 @@ def build_county_metadata_table(
                     "crs_list": [],
                     "crs_dict": {},
                     "canonical_pct": 0.0,
-                    "note": "No tiles found"
+                    "note": "No 6-in tiles found"
                 })
                 continue
+            
+            year, layer_id, layer_name, layer_url, attrs_list = layer_info
             
             # Extract metadata from attributes (same filter as download_6in_tiles)
             # Filter for 6-inch tiles only
