@@ -220,11 +220,12 @@ def build_county_metadata_table(
     counties: List[str],
     session: requests.Session,
 ) -> List[Dict]:
-    """Build metadata table for counties.
+    """Build metadata table for counties (6-inch tiles only).
     
-    For each county, queries feature server and remote rasters to gather:
+    For each county, queries feature server and remote rasters to gather metadata on 6-inch tiles
+    (matching the same tiles downloaded by download_6in_tiles()):
     - Capture dates (list of distinct dates)
-    - Pixel size
+    - Pixel size (will be "06 in." after filtering)
     - Tile count
     - CRS distribution (histogram)
     - % of tiles conforming to reference CRS (EPSG:2968)
@@ -232,11 +233,11 @@ def build_county_metadata_table(
     Returns list of dicts, one per county, with keys:
       - county: county name
       - capture_dates: sorted list of distinct capture dates
-      - pixel_size: pixel size string (e.g. "06 in.")
-      - tile_count: number of tiles
-      - crs_list: list of distinct CRS strings found
+      - pixel_size: pixel size string (always "06 in." after filtering)
+      - tile_count: number of 6-inch tiles
+      - crs_list: list of distinct CRS strings found in 6-inch tiles
       - crs_dict: dict mapping CRS -> count
-      - canonical_pct: % of tiles in EPSG:2968
+      - canonical_pct: % of 6-inch tiles in EPSG:2968
     """
     CANONICAL_CRS = "EPSG:2968"  # Indiana West
     
@@ -283,6 +284,7 @@ def build_county_metadata_table(
                 continue
             
             # Extract metadata from feature attributes
+            # Filter for 6-inch tiles only (matching download_6in_tiles behavior)
             capture_dates = set()
             pixel_sizes = set()
             urls = []
@@ -290,13 +292,17 @@ def build_county_metadata_table(
             for feat in features:
                 attrs = feat.get("attributes", {})
                 
+                # Only process 6-inch tiles (must match download_6in_tiles filtering)
+                if attrs.get("pixel_size", "") != "06 in.":
+                    continue
+                
                 # Try various date field names
                 for date_field in ["capture_date", "capture_date_text", "date", "acquisition_date", "Photo_Date"]:
                     if date_field in attrs and attrs[date_field]:
                         capture_dates.add(str(attrs[date_field]))
                         break
                 
-                # Get pixel size
+                # Get pixel size (will be "06 in." after filter)
                 if "pixel_size" in attrs and attrs["pixel_size"]:
                     pixel_sizes.add(str(attrs["pixel_size"]))
                 
