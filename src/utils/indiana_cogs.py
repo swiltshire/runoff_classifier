@@ -278,6 +278,16 @@ def build_county_metadata_table(
             pixel_sizes = set()
             urls = []
             
+            # DEBUG: Check what pixel_size values exist in the data
+            pixel_size_values = {}
+            for attr in attrs_list:
+                ps = attr.get("pixel_size", "")
+                if ps not in pixel_size_values:
+                    pixel_size_values[ps] = 0
+                pixel_size_values[ps] += 1
+            
+            print(f"      pixel_size distribution: {pixel_size_values}")
+            
             for attrs in attrs_list:
                 # Only process 6-inch tiles (must match download_6in_tiles filtering)
                 # Uses exact same filter: pixel_size in ("06 in.",) and has url_tif
@@ -303,9 +313,7 @@ def build_county_metadata_table(
             canonical_count = 0
             
             pixel_size_str = sorted(pixel_sizes)[0] if pixel_sizes else "N/A"
-            print(f"  {county}: Found {len(attrs_list)} total features, {len(urls)} 6-in tiles")
-            if len(urls) == 0 and len(attrs_list) > 0:
-                print(f"    ⚠ DEBUG: 0 urls passed filter but {len(attrs_list)} features exist")
+            print(f"      Filtered to {len(urls)} 6-in tiles from {len(attrs_list)} total features")
             
             for url in tqdm(urls, desc=f"    {county} CRS", unit="tile", leave=False):
                 crs = get_remote_crs(url)
@@ -416,6 +424,7 @@ def fetch_attrs(session: requests.Session, layer_url: str, where: str) -> List[D
     out = []
     offset = 0
     first_request = True
+    sample_attrs = None
     while True:
         params = {
             "where": where,
@@ -433,11 +442,17 @@ def fetch_attrs(session: requests.Session, layer_url: str, where: str) -> List[D
         if first_request:
             if "error" in js:
                 print(f"      ERROR from server: {js['error']}")
-            feats_count = len(js.get("features", []))
-            print(f"      First request: {feats_count} features returned (where='{where}')")
+            feats = js.get("features", [])
+            feats_count = len(feats)
+            print(f"      Query returned {feats_count} features")
+            if feats_count > 0:
+                sample_attrs = feats[0].get("attributes", {})
+                print(f"      Sample feature attributes: {sample_attrs}")
+                print(f"      Field names in response: {list(sample_attrs.keys())}")
             first_request = False
+        else:
+            feats = js.get("features", [])
         
-        feats = js.get("features", [])
         out.extend([f["attributes"] for f in feats])
         if not feats or not js.get("exceededTransferLimit"):
             break
