@@ -484,34 +484,42 @@ def download_one(url: str, dest: Path, session: requests.Session) -> str:
         else:
             dest.unlink(missing_ok=True)
 
-    # download fresh
-    try:
-        with session.get(url, stream=True, timeout=(10, 300)) as r:
-            r.raise_for_status()
+    # download fresh with retry logic
+    max_retries = 2
+    for attempt in range(max_retries + 1):
+        try:
+            with session.get(url, stream=True, timeout=(10, 300)) as r:
+                r.raise_for_status()
 
-            content_type = r.headers.get("content-type", "").lower()
-            if "tif" not in content_type and "image" not in content_type:
-                raise RuntimeError(f"not a tif: {content_type}")
+                content_type = r.headers.get("content-type", "").lower()
+                if "tif" not in content_type and "image" not in content_type:
+                    raise RuntimeError(f"not a tif: {content_type}")
 
-            with open(dest, "wb") as f:
-                for chunk in r.iter_content(4 * 1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_content(4 * 1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+            
+            # Validate after successful download
+            if not matches_remote_size(dest, remote):
+                dest.unlink(missing_ok=True)
+                raise RuntimeError("size mismatch after download")
+            
+            if not is_valid_tiff_header(dest):
+                dest.unlink(missing_ok=True)
+                raise RuntimeError("invalid tiff header after download")
+            
+            # All validations passed
+            return "downloaded"
 
-    except (requests.RequestException, OSError, RuntimeError):
-        dest.unlink(missing_ok=True)
-        return "failed"
-
-    # validate after download
-    if not matches_remote_size(dest, remote):
-        dest.unlink(missing_ok=True)
-        return "failed"
-
-    if not is_valid_tiff_header(dest):
-        dest.unlink(missing_ok=True)
-        return "failed"
-
-    return "downloaded"
+        except (requests.RequestException, OSError, RuntimeError) as e:
+            dest.unlink(missing_ok=True)
+            if attempt < max_retries:
+                # Retry with exponential backoff: 0.5s, 1s
+                time.sleep(0.5 * (2 ** attempt))
+            else:
+                # All retries exhausted
+                return "failed"
 
 
 # ---------------- public api ----------------
