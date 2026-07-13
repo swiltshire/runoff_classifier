@@ -283,6 +283,12 @@ def build_county_metadata_table(
                 })
                 continue
             
+            # DEBUG: Check what pixel sizes are actually in the data
+            sample_pixel_sizes = set()
+            for feat in features[:5]:  # Sample first 5 features
+                ps = feat.get("attributes", {}).get("pixel_size", "")
+                sample_pixel_sizes.add(ps)
+            
             # Extract metadata from feature attributes
             # Filter for 6-inch tiles only (matching download_6in_tiles behavior)
             capture_dates = set()
@@ -315,7 +321,11 @@ def build_county_metadata_table(
             canonical_count = 0
             
             pixel_size_str = sorted(pixel_sizes)[0] if pixel_sizes else "N/A"
-            print(f"  {county}: Found {len(urls)} tiles ({pixel_size_str}), querying CRS...")
+            print(f"  {county}: Found {len(features)} total features, {len(urls)} 6-in tiles")
+            if sample_pixel_sizes:
+                print(f"    Sample pixel_size values in data: {sample_pixel_sizes}")
+            if len(urls) == 0 and len(features) > 0:
+                print(f"    ⚠ DEBUG: 0 urls passed filter but {len(features)} features exist - check pixel_size format")
             
             for url in tqdm(urls, desc=f"    {county} CRS", unit="tile", leave=False):
                 crs = get_remote_crs(url)
@@ -328,8 +338,11 @@ def build_county_metadata_table(
             
             canonical_pct = (canonical_count / len(urls) * 100) if urls else 0.0
             
-            crs_summary = ", ".join([f"{k}({v})" for k, v in sorted(crs_dict.items())])
-            print(f"    ✓ CRS: {crs_summary} | EPSG:2968 conformance: {canonical_pct:.1f}%")
+            if len(urls) > 0:
+                crs_summary = ", ".join([f"{k}({v})" for k, v in sorted(crs_dict.items())])
+                print(f"    ✓ CRS: {crs_summary} | EPSG:2968 conformance: {canonical_pct:.1f}%")
+            else:
+                print(f"    (No 6-in tiles to query)")
             
             results.append({
                 "county": county,
