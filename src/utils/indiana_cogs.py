@@ -245,13 +245,32 @@ def build_county_metadata_table(
     if not layers:
         raise RuntimeError("No Footprint_YYYY layers found")
     
-    # Use newest layer
-    year, layer_id, layer_name = layers[0]
+    # Loop through layers (newest first) until we find one with 6-inch tiles
+    # This matches the logic in download_6in_tiles()
+    layer_info = None
+    for year, layer_id, layer_name in layers:
+        test_url = f"{SERVICE_URL}/{layer_id}"
+        # Check first 3 counties to see if this layer has 6-inch tiles
+        has_6in = False
+        for test_county in list(counties)[:3]:
+            test_attrs = fetch_attrs(session, test_url, county_where(test_county))
+            if any(a.get("pixel_size", "") in ("06 in.",) for a in test_attrs):
+                has_6in = True
+                break
+        if has_6in:
+            layer_info = (year, layer_id, layer_name)
+            break
+    
+    if not layer_info:
+        raise RuntimeError("No layers with 6-inch tiles found")
+    
+    year, layer_id, layer_name = layer_info
     layer_url = f"{SERVICE_URL}/{layer_id}"
     
     results = []
     
-    print(f"\n[Metadata] Querying {len(counties)} counties from {layer_name} (year {year})")
+    print(f"\n[Metadata] Using {layer_name} (year {year}) - 6-inch tiles detected")
+    print(f"[Metadata] Querying {len(counties)} counties...")
     
     for county in tqdm(counties, desc="Counties processed", unit="county"):
         try:
@@ -278,16 +297,6 @@ def build_county_metadata_table(
             pixel_sizes = set()
             urls = []
             
-            # DEBUG: Check what pixel_size values exist in the data
-            pixel_size_values = {}
-            for attr in attrs_list:
-                ps = attr.get("pixel_size", "")
-                if ps not in pixel_size_values:
-                    pixel_size_values[ps] = 0
-                pixel_size_values[ps] += 1
-            
-            print(f"      pixel_size distribution: {pixel_size_values}")
-            
             for attrs in attrs_list:
                 # Only process 6-inch tiles (must match download_6in_tiles filtering)
                 # Uses exact same filter: pixel_size in ("06 in.",) and has url_tif
@@ -313,7 +322,8 @@ def build_county_metadata_table(
             canonical_count = 0
             
             pixel_size_str = sorted(pixel_sizes)[0] if pixel_sizes else "N/A"
-            print(f"      Filtered to {len(urls)} 6-in tiles from {len(attrs_list)} total features")
+            
+            print(f"  {county}: Found {len(urls)} 6-in tiles ({pixel_size_str}), querying CRS...")
             
             for url in tqdm(urls, desc=f"    {county} CRS", unit="tile", leave=False):
                 crs = get_remote_crs(url)
@@ -423,8 +433,6 @@ def fetch_all_indiana_counties(session: requests.Session) -> List[str]:
 def fetch_attrs(session: requests.Session, layer_url: str, where: str) -> List[Dict]:
     out = []
     offset = 0
-    first_request = True
-    sample_attrs = None
     while True:
         params = {
             "where": where,
@@ -437,22 +445,7 @@ def fetch_attrs(session: requests.Session, layer_url: str, where: str) -> List[D
         r = session.get(layer_url+"/query", params=params, timeout=60)
         r.raise_for_status()
         js = r.json()
-        
-        # Debug on first request
-        if first_request:
-            if "error" in js:
-                print(f"      ERROR from server: {js['error']}")
-            feats = js.get("features", [])
-            feats_count = len(feats)
-            print(f"      Query returned {feats_count} features")
-            if feats_count > 0:
-                sample_attrs = feats[0].get("attributes", {})
-                print(f"      Sample feature attributes: {sample_attrs}")
-                print(f"      Field names in response: {list(sample_attrs.keys())}")
-            first_request = False
-        else:
-            feats = js.get("features", [])
-        
+        feats = js.get("features", [])
         out.extend([f["attributes"] for f in feats])
         if not feats or not js.get("exceededTransferLimit"):
             break
