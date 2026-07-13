@@ -194,6 +194,153 @@ def inspect_layer_metadata(session: requests.Session, year: int = None) -> Dict:
     }
 
 
+# ----------- county metadata table builder -----------
+
+def get_remote_crs(url: str) -> str:
+    """Query remote raster CRS without downloading.
+    
+    Opens remote GeoTIFF via rasterio and returns CRS as string.
+    Returns "UNKNOWN" if CRS cannot be determined.
+    """
+    try:
+        import rasterio
+        with rasterio.open(url) as ds:
+            if ds.crs:
+                # Return as "EPSG:code" format if possible
+                epsg = ds.crs.to_epsg()
+                if epsg:
+                    return f"EPSG:{epsg}"
+                return str(ds.crs)
+            return "UNKNOWN"
+    except Exception as e:
+        return "UNKNOWN"
+
+
+def build_county_metadata_table(
+    counties: List[str],
+    session: requests.Session,
+) -> List[Dict]:
+    """Build metadata table for counties.
+    
+    For each county, queries feature server and remote rasters to gather:
+    - Capture dates (list of distinct dates)
+    - Pixel size
+    - Tile count
+    - CRS distribution (histogram)
+    - % of tiles conforming to reference CRS (EPSG:2968)
+    
+    Returns list of dicts, one per county, with keys:
+      - county: county name
+      - capture_dates: sorted list of distinct capture dates
+      - pixel_size: pixel size string (e.g. "06 in.")
+      - tile_count: number of tiles
+      - crs_list: list of distinct CRS strings found
+      - crs_dict: dict mapping CRS -> count
+      - canonical_pct: % of tiles in EPSG:2968
+    """
+    CANONICAL_CRS = "EPSG:2968"  # Indiana West
+    
+    layers = get_layers(session)
+    if not layers:
+        raise RuntimeError("No Footprint_YYYY layers found")
+    
+    # Use newest layer
+    year, layer_id, layer_name = layers[0]
+    layer_url = f"{SERVICE_URL}/{layer_id}"
+    
+    results = []
+    
+    for county in counties:
+        try:
+            # Query feature server for all tiles in this county
+            # Try to fetch capture_date field if available; fall back to available fields
+            params = {
+                "where": county_where(county),
+                "outFields": "*",  # get all fields to see what's available
+                "returnGeometry": False,
+                "resultRecordCount": 10000,
+                "f": "json"
+            }
+            r = session.get(f"{layer_url}/query", params=params, timeout=60)
+            r.raise_for_status()
+            js = r.json()
+            
+            features = js.get("features", [])
+            if not features:
+                results.append({
+                    "county": county,
+                    "capture_dates": [],
+                    "pixel_size": "N/A",
+                    "tile_count": 0,
+                    "crs_list": [],
+                    "crs_dict": {},
+                    "canonical_pct": 0.0,
+                    "note": "No tiles found"
+                })
+                continue
+            
+            # Extract metadata from feature attributes
+            capture_dates = set()
+            pixel_sizes = set()
+            urls = []
+            
+            for feat in features:
+                attrs = feat.get("attributes", {})
+                
+                # Try various date field names
+                for date_field in ["capture_date", "capture_date_text", "date", "acquisition_date", "Photo_Date"]:
+                    if date_field in attrs and attrs[date_field]:
+                        capture_dates.add(str(attrs[date_field]))
+                        break
+                
+                # Get pixel size
+                if "pixel_size" in attrs and attrs["pixel_size"]:
+                    pixel_sizes.add(str(attrs["pixel_size"]))
+                
+                # Get URL for CRS extraction
+                if "url_tif" in attrs and attrs["url_tif"]:
+                    urls.append(attrs["url_tif"])
+            
+            # Query remote CRS for each tile
+            crs_dict = {}
+            canonical_count = 0
+            
+            for url in urls:
+                crs = get_remote_crs(url)
+                if crs not in crs_dict:
+                    crs_dict[crs] = 0
+                crs_dict[crs] += 1
+                
+                if crs == CANONICAL_CRS:
+                    canonical_count += 1
+            
+            canonical_pct = (canonical_count / len(urls) * 100) if urls else 0.0
+            
+            results.append({
+                "county": county,
+                "capture_dates": sorted(capture_dates),
+                "pixel_size": sorted(pixel_sizes)[0] if pixel_sizes else "N/A",
+                "tile_count": len(urls),
+                "crs_list": sorted(crs_dict.keys()),
+                "crs_dict": crs_dict,
+                "canonical_pct": round(canonical_pct, 1),
+            })
+            
+        except Exception as e:
+            results.append({
+                "county": county,
+                "capture_dates": [],
+                "pixel_size": "ERROR",
+                "tile_count": 0,
+                "crs_list": [],
+                "crs_dict": {},
+                "canonical_pct": 0.0,
+                "note": f"Error: {str(e)}"
+            })
+    
+    return results
+
+
 # ---------------- FeatureServer queries ----------------
 
 def get_layers(session: requests.Session) -> List[Tuple[int,int,str]]:
