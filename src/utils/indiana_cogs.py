@@ -255,6 +255,7 @@ def build_county_metadata_table(
     
     for county in tqdm(counties, desc="Counties processed", unit="county"):
         try:
+            print(f"\n>>> DEBUG: Processing {county}")  # Very visible marker
             # Query feature server for all tiles in this county
             # Try to fetch capture_date field if available; fall back to available fields
             params = {
