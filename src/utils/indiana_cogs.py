@@ -256,10 +256,13 @@ def build_county_metadata_table(
             test_attrs = fetch_attrs(session, test_url, county_where(test_county))
             if any(a.get("pixel_size", "") in ("06 in.",) for a in test_attrs):
                 has_6in = True
+                print(f"  Found 6-in tiles in {layer_name}")
                 break
         if has_6in:
             layer_info = (year, layer_id, layer_name)
             break
+        else:
+            print(f"  {layer_name}: No 6-in tiles in sample")
     
     if not layer_info:
         raise RuntimeError("No layers with 6-inch tiles found")
