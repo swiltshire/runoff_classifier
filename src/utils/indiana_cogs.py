@@ -316,7 +316,8 @@ def build_county_metadata_table(
             print(f"  {county}: Found {len(urls)} 6-in tiles ({pixel_size_str}), querying CRS (parallel)...")
             
             # Use ThreadPoolExecutor for parallel CRS queries (I/O bound)
-            with ThreadPoolExecutor(max_workers=24) as executor:
+            # 48 workers for ml.g4dn.12xlarge (48 vCPUs, I/O-bound networking)
+            with ThreadPoolExecutor(max_workers=48) as executor:
                 futures = {executor.submit(get_remote_crs, url): url for url in urls}
                 
                 for future in tqdm(as_completed(futures), total=len(urls), desc=f"    {county} CRS", unit="tile", leave=False):
