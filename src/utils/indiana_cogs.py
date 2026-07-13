@@ -250,29 +250,16 @@ def build_county_metadata_table(
     layer_info = None
     for year, layer_id, layer_name in layers:
         test_url = f"{SERVICE_URL}/{layer_id}"
-        # Quick single check: do a broad query to see if this layer has ANY 6-inch tiles
-        # Don't filter by county - just get a sample of what's in the layer
-        try:
-            r = session.get(
-                f"{test_url}/query",
-                params={
-                    "where": "1=1",
-                    "outFields": "pixel_size",
-                    "returnGeometry": "false",
-                    "resultRecordCount": 100,
-                    "f": "json"
-                },
-                timeout=30
-            )
-            r.raise_for_status()
-            js = r.json()
-            feats = js.get("features", [])
-            has_6in = any(f.get("attributes", {}).get("pixel_size", "") in ("06 in.",) for f in feats)
-            if has_6in:
-                layer_info = (year, layer_id, layer_name)
+        # Check first 3 counties to see if this layer has 6-inch tiles
+        has_6in = False
+        for test_county in list(counties)[:3]:
+            test_attrs = fetch_attrs(session, test_url, county_where(test_county))
+            if any(a.get("pixel_size", "") in ("06 in.",) for a in test_attrs):
+                has_6in = True
                 break
-        except Exception:
-            continue  # try next layer if this one errors
+        if has_6in:
+            layer_info = (year, layer_id, layer_name)
+            break
     
     if not layer_info:
         raise RuntimeError("No layers with 6-inch tiles found")
@@ -330,22 +317,32 @@ def build_county_metadata_table(
                 if "url_tif" in attrs and attrs["url_tif"]:
                     urls.append(attrs["url_tif"])
             
-            # Query remote CRS for each tile
+            # Query remote CRS for each tile (parallel - I/O bound)
             crs_dict = {}
             canonical_count = 0
             
             pixel_size_str = sorted(pixel_sizes)[0] if pixel_sizes else "N/A"
             
-            print(f"  {county}: Found {len(urls)} 6-in tiles ({pixel_size_str}), querying CRS...")
+            print(f"  {county}: Found {len(urls)} 6-in tiles ({pixel_size_str}), querying CRS (parallel)...")
             
-            for url in tqdm(urls, desc=f"    {county} CRS", unit="tile", leave=False):
-                crs = get_remote_crs(url)
-                if crs not in crs_dict:
-                    crs_dict[crs] = 0
-                crs_dict[crs] += 1
+            # Use ThreadPoolExecutor for parallel CRS queries (I/O bound)
+            with ThreadPoolExecutor(max_workers=24) as executor:
+                futures = {executor.submit(get_remote_crs, url): url for url in urls}
                 
-                if crs == CANONICAL_CRS:
-                    canonical_count += 1
+                for future in tqdm(as_completed(futures), total=len(urls), desc=f"    {county} CRS", unit="tile", leave=False):
+                    try:
+                        crs = future.result(timeout=60)
+                        if crs not in crs_dict:
+                            crs_dict[crs] = 0
+                        crs_dict[crs] += 1
+                        
+                        if crs == CANONICAL_CRS:
+                            canonical_count += 1
+                    except Exception:
+                        # Track failures as UNKNOWN
+                        if "UNKNOWN" not in crs_dict:
+                            crs_dict["UNKNOWN"] = 0
+                        crs_dict["UNKNOWN"] += 1
             
             canonical_pct = (canonical_count / len(urls) * 100) if urls else 0.0
             
