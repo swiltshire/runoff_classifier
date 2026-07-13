@@ -250,16 +250,29 @@ def build_county_metadata_table(
     layer_info = None
     for year, layer_id, layer_name in layers:
         test_url = f"{SERVICE_URL}/{layer_id}"
-        # Check first 3 counties to see if this layer has 6-inch tiles
-        has_6in = False
-        for test_county in list(counties)[:3]:
-            test_attrs = fetch_attrs(session, test_url, county_where(test_county))
-            if any(a.get("pixel_size", "") in ("06 in.",) for a in test_attrs):
-                has_6in = True
+        # Quick single check: do a broad query to see if this layer has ANY 6-inch tiles
+        # Don't filter by county - just get a sample of what's in the layer
+        try:
+            r = session.get(
+                f"{test_url}/query",
+                params={
+                    "where": "1=1",
+                    "outFields": "pixel_size",
+                    "returnGeometry": "false",
+                    "resultRecordCount": 100,
+                    "f": "json"
+                },
+                timeout=30
+            )
+            r.raise_for_status()
+            js = r.json()
+            feats = js.get("features", [])
+            has_6in = any(f.get("attributes", {}).get("pixel_size", "") in ("06 in.",) for f in feats)
+            if has_6in:
+                layer_info = (year, layer_id, layer_name)
                 break
-        if has_6in:
-            layer_info = (year, layer_id, layer_name)
-            break
+        except Exception:
+            continue  # try next layer if this one errors
     
     if not layer_info:
         raise RuntimeError("No layers with 6-inch tiles found")
