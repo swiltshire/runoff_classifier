@@ -415,6 +415,7 @@ def fetch_all_indiana_counties(session: requests.Session) -> List[str]:
 def fetch_attrs(session: requests.Session, layer_url: str, where: str) -> List[Dict]:
     out = []
     offset = 0
+    first_request = True
     while True:
         params = {
             "where": where,
@@ -427,6 +428,15 @@ def fetch_attrs(session: requests.Session, layer_url: str, where: str) -> List[D
         r = session.get(layer_url+"/query", params=params, timeout=60)
         r.raise_for_status()
         js = r.json()
+        
+        # Debug on first request
+        if first_request:
+            if "error" in js:
+                print(f"      ERROR from server: {js['error']}")
+            feats_count = len(js.get("features", []))
+            print(f"      First request: {feats_count} features returned (where='{where}')")
+            first_request = False
+        
         feats = js.get("features", [])
         out.extend([f["attributes"] for f in feats])
         if not feats or not js.get("exceededTransferLimit"):
