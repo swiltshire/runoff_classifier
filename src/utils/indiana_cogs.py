@@ -267,6 +267,8 @@ def build_county_metadata_table(
                 print(f"  ⚠ {county}: No layers with 6-inch tiles found")
                 results.append({
                     "county": county,
+                    "imagery_year": None,
+                    "layer": None,
                     "capture_dates": [],
                     "pixel_size": "N/A",
                     "tile_count": 0,
@@ -342,6 +344,8 @@ def build_county_metadata_table(
             
             results.append({
                 "county": county,
+                "imagery_year": year,
+                "layer": layer_name,
                 "capture_dates": sorted(capture_dates),
                 "pixel_size": pixel_size_str,
                 "tile_count": len(urls),
@@ -354,6 +358,8 @@ def build_county_metadata_table(
             print(f"  ✗ {county}: ERROR - {str(e)}")
             results.append({
                 "county": county,
+                "imagery_year": None,
+                "layer": None,
                 "capture_dates": [],
                 "pixel_size": "ERROR",
                 "tile_count": 0,
