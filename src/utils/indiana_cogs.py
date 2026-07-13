@@ -250,7 +250,9 @@ def build_county_metadata_table(
     
     results = []
     
-    for county in counties:
+    print(f"\n[Metadata] Querying {len(counties)} counties from {layer_name} (year {year})")
+    
+    for county in tqdm(counties, desc="Counties processed", unit="county"):
         try:
             # Query feature server for all tiles in this county
             # Try to fetch capture_date field if available; fall back to available fields
@@ -267,6 +269,7 @@ def build_county_metadata_table(
             
             features = js.get("features", [])
             if not features:
+                print(f"  ⚠ {county}: No tiles found")
                 results.append({
                     "county": county,
                     "capture_dates": [],
@@ -305,7 +308,10 @@ def build_county_metadata_table(
             crs_dict = {}
             canonical_count = 0
             
-            for url in urls:
+            pixel_size_str = sorted(pixel_sizes)[0] if pixel_sizes else "N/A"
+            print(f"  {county}: Found {len(urls)} tiles ({pixel_size_str}), querying CRS...")
+            
+            for url in tqdm(urls, desc=f"    {county} CRS", unit="tile", leave=False):
                 crs = get_remote_crs(url)
                 if crs not in crs_dict:
                     crs_dict[crs] = 0
@@ -316,10 +322,13 @@ def build_county_metadata_table(
             
             canonical_pct = (canonical_count / len(urls) * 100) if urls else 0.0
             
+            crs_summary = ", ".join([f"{k}({v})" for k, v in sorted(crs_dict.items())])
+            print(f"    ✓ CRS: {crs_summary} | EPSG:2968 conformance: {canonical_pct:.1f}%")
+            
             results.append({
                 "county": county,
                 "capture_dates": sorted(capture_dates),
-                "pixel_size": sorted(pixel_sizes)[0] if pixel_sizes else "N/A",
+                "pixel_size": pixel_size_str,
                 "tile_count": len(urls),
                 "crs_list": sorted(crs_dict.keys()),
                 "crs_dict": crs_dict,
@@ -327,6 +336,7 @@ def build_county_metadata_table(
             })
             
         except Exception as e:
+            print(f"  ✗ {county}: ERROR - {str(e)}")
             results.append({
                 "county": county,
                 "capture_dates": [],
@@ -338,6 +348,7 @@ def build_county_metadata_table(
                 "note": f"Error: {str(e)}"
             })
     
+    print(f"\n[Metadata] Complete. Processed {len(results)} counties.\n")
     return results
 
 
