@@ -200,20 +200,32 @@ def get_remote_crs(url: str) -> str:
     """Query remote raster CRS without downloading.
     
     Opens remote GeoTIFF via rasterio and returns CRS as string.
-    Returns "UNKNOWN" if CRS cannot be determined.
+    Returns "UNKNOWN" if CRS cannot be determined after retries.
+    
+    Retries up to 2 times with backoff to distinguish network hiccups
+    (which succeed on retry) from actual data corruption (consistent failures).
     """
-    try:
-        import rasterio
-        with rasterio.open(url) as ds:
-            if ds.crs:
-                # Return as "EPSG:code" format if possible
-                epsg = ds.crs.to_epsg()
-                if epsg:
-                    return f"EPSG:{epsg}"
-                return str(ds.crs)
+    import time
+    max_retries = 2
+    
+    for attempt in range(max_retries + 1):
+        try:
+            import rasterio
+            with rasterio.open(url) as ds:
+                if ds.crs:
+                    # Return as "EPSG:code" format if possible
+                    epsg = ds.crs.to_epsg()
+                    if epsg:
+                        return f"EPSG:{epsg}"
+                    return str(ds.crs)
+                return "UNKNOWN"
+        except Exception as e:
+            # Retry with backoff on transient errors
+            if attempt < max_retries:
+                time.sleep(0.5 * (2 ** attempt))  # exponential backoff: 0.5s, 1s
+                continue
+            # After all retries exhausted, mark as UNKNOWN
             return "UNKNOWN"
-    except Exception as e:
-        return "UNKNOWN"
 
 
 def build_county_metadata_table(
