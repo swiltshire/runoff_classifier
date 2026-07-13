@@ -255,22 +255,10 @@ def build_county_metadata_table(
     
     for county in tqdm(counties, desc="Counties processed", unit="county"):
         try:
-            print(f"\n>>> DEBUG: Processing {county}")  # Very visible marker
-            # Query feature server for all tiles in this county
-            # Try to fetch capture_date field if available; fall back to available fields
-            params = {
-                "where": county_where(county),
-                "outFields": "*",  # get all fields to see what's available
-                "returnGeometry": False,
-                "resultRecordCount": 10000,
-                "f": "json"
-            }
-            r = session.get(f"{layer_url}/query", params=params, timeout=60)
-            r.raise_for_status()
-            js = r.json()
+            # Use fetch_attrs for consistent feature server query (same as download_6in_tiles)
+            attrs_list = fetch_attrs(session, layer_url, county_where(county))
             
-            features = js.get("features", [])
-            if not features:
+            if not attrs_list:
                 print(f"  ⚠ {county}: No tiles found")
                 results.append({
                     "county": county,
@@ -284,23 +272,16 @@ def build_county_metadata_table(
                 })
                 continue
             
-            # DEBUG: Check what pixel sizes are actually in the data
-            sample_pixel_sizes = set()
-            for feat in features[:5]:  # Sample first 5 features
-                ps = feat.get("attributes", {}).get("pixel_size", "")
-                sample_pixel_sizes.add(ps)
-            
-            # Extract metadata from feature attributes
-            # Filter for 6-inch tiles only (matching download_6in_tiles behavior)
+            # Extract metadata from attributes (same filter as download_6in_tiles)
+            # Filter for 6-inch tiles only
             capture_dates = set()
             pixel_sizes = set()
             urls = []
             
-            for feat in features:
-                attrs = feat.get("attributes", {})
-                
+            for attrs in attrs_list:
                 # Only process 6-inch tiles (must match download_6in_tiles filtering)
-                if attrs.get("pixel_size", "") != "06 in.":
+                # Uses exact same filter: pixel_size in ("06 in.",) and has url_tif
+                if attrs.get("pixel_size", "") not in ("06 in.",) or not attrs.get("url_tif"):
                     continue
                 
                 # Try various date field names
@@ -322,11 +303,9 @@ def build_county_metadata_table(
             canonical_count = 0
             
             pixel_size_str = sorted(pixel_sizes)[0] if pixel_sizes else "N/A"
-            print(f"  {county}: Found {len(features)} total features, {len(urls)} 6-in tiles")
-            if sample_pixel_sizes:
-                print(f"    Sample pixel_size values in data: {sample_pixel_sizes}")
-            if len(urls) == 0 and len(features) > 0:
-                print(f"    ⚠ DEBUG: 0 urls passed filter but {len(features)} features exist - check pixel_size format")
+            print(f"  {county}: Found {len(attrs_list)} total features, {len(urls)} 6-in tiles")
+            if len(urls) == 0 and len(attrs_list) > 0:
+                print(f"    ⚠ DEBUG: 0 urls passed filter but {len(attrs_list)} features exist")
             
             for url in tqdm(urls, desc=f"    {county} CRS", unit="tile", leave=False):
                 crs = get_remote_crs(url)
