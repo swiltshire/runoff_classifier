@@ -13,6 +13,9 @@ from tqdm import tqdm
 
 SERVICE_URL = "https://gisdata.in.gov/server/rest/services/Hosted/Indiana_Orthoimagery_Tile_Footprints/FeatureServer"
 
+# Dynamic reference CRS for re-projection (determined by survey_training_crs)
+CANONICAL_CRS = "EPSG:2968"  # Default; will be set dynamically based on training data
+
 
 # ---------------- project root ----------------
 
@@ -47,6 +50,16 @@ def make_session() -> requests.Session:
     s.mount("https://", adapter)
     s.mount("http://", adapter)
     return s
+
+
+def set_reference_crs(crs: str) -> None:
+    """Update the global reference CRS for re-projection.
+    
+    Args:
+        crs: CRS string (e.g., "EPSG:2968")
+    """
+    global CANONICAL_CRS
+    CANONICAL_CRS = crs
 
 
 # ---------------- helpers ----------------
@@ -231,6 +244,7 @@ def get_remote_crs(url: str) -> str:
 def build_county_metadata_table(
     counties: List[str],
     session: requests.Session,
+    imagery_years_csv: Optional[Path] = None,
 ) -> List[Dict]:
     """Build metadata table for counties (6-inch tiles only).
     
@@ -240,18 +254,26 @@ def build_county_metadata_table(
     - Pixel size (will be "06 in." after filtering)
     - Tile count
     - CRS distribution (histogram)
-    - % of tiles conforming to reference CRS (EPSG:2968)
+    - % of tiles conforming to reference CRS (from global CANONICAL_CRS)
+    
+    If imagery_years_csv provided, uses specified years for each county (strict mode - fails if year unavailable).
+    Otherwise, auto-detects by finding newest layer with 6-inch tiles per county.
     
     Returns list of dicts, one per county, with keys:
       - county: county name
+      - imagery_year: year selected (from CSV or auto-detected)
+      - layer: layer name (Footprint_YYYY)
       - capture_dates: sorted list of distinct capture dates
       - pixel_size: pixel size string (always "06 in." after filtering)
       - tile_count: number of 6-inch tiles
       - crs_list: list of distinct CRS strings found in 6-inch tiles
       - crs_dict: dict mapping CRS -> count
-      - canonical_pct: % of 6-inch tiles in EPSG:2968
+      - canonical_pct: % of 6-inch tiles in current CANONICAL_CRS
     """
-    CANONICAL_CRS = "EPSG:2968"  # Indiana West
+    # Load imagery years if CSV provided
+    imagery_years = {}
+    if imagery_years_csv:
+        imagery_years = load_training_imagery_years(imagery_years_csv)
     
     layers = get_layers(session)
     if not layers:
@@ -259,37 +281,45 @@ def build_county_metadata_table(
     
     results = []
     
-    print(f"\n[Metadata] Querying {len(counties)} counties (finding best layer per county)...")
+    print(f"\n[Metadata] Querying {len(counties)} counties (using reference CRS: {CANONICAL_CRS})...")
     
     for county in tqdm(counties, desc="Counties processed", unit="county"):
         try:
-            # Find newest layer with 6-inch tiles for THIS county
-            # (matches download_6in_tiles logic - per-county layer selection)
+            # Find layer with 6-inch tiles for THIS county
+            # If imagery_years_csv provided and county in it, use that specific year (strict mode)
+            # Otherwise, auto-detect: find newest layer with 6-inch tiles
             layer_info = None
-            for year, layer_id, layer_name in layers:
+            
+            if imagery_years and county in imagery_years:
+                # Strict mode: use specified year from CSV
+                specified_year = imagery_years[county]
+                year_layer = year_to_layer_id(specified_year, session)
+                if not year_layer:
+                    raise RuntimeError(f"CSV specifies year {specified_year} but Footprint_{specified_year} layer not found")
+                
+                layer_id, layer_name = year_layer
                 test_url = f"{SERVICE_URL}/{layer_id}"
                 attrs_list = fetch_attrs(session, test_url, county_where(county))
                 
-                # Check if this layer has 6-in tiles for this county
-                if any(a.get("pixel_size", "") in ("06 in.",) for a in attrs_list):
-                    layer_info = (year, layer_id, layer_name, test_url, attrs_list)
-                    break
+                # Validate that this layer has 6-in tiles for county
+                six_inch_attrs = [a for a in attrs_list if a.get("pixel_size") == "06 in."]
+                if not six_inch_attrs:
+                    raise RuntimeError(f"Incomplete tile set: County {county} in year {specified_year} has 0 6-inch tiles")
+                
+                layer_info = (specified_year, layer_id, layer_name, test_url, attrs_list)
+            else:
+                # Auto-detect mode: find newest layer with 6-inch tiles for this county
+                for year, layer_id, layer_name in layers:
+                    test_url = f"{SERVICE_URL}/{layer_id}"
+                    attrs_list = fetch_attrs(session, test_url, county_where(county))
+                    
+                    # Check if this layer has 6-in tiles for this county
+                    if any(a.get("pixel_size", "") in ("06 in.",) for a in attrs_list):
+                        layer_info = (year, layer_id, layer_name, test_url, attrs_list)
+                        break
             
             if not layer_info:
-                print(f"  ⚠ {county}: No layers with 6-inch tiles found")
-                results.append({
-                    "county": county,
-                    "imagery_year": None,
-                    "layer": None,
-                    "capture_dates": [],
-                    "pixel_size": "N/A",
-                    "tile_count": 0,
-                    "crs_list": [],
-                    "crs_dict": {},
-                    "canonical_pct": 0.0,
-                    "note": "No 6-in tiles found"
-                })
-                continue
+                raise RuntimeError("No layers with 6-inch tiles found")
             
             year, layer_id, layer_name, layer_url, attrs_list = layer_info
             
@@ -403,6 +433,227 @@ def get_layers(session: requests.Session) -> List[Tuple[int,int,str]]:
 def county_where(county: str) -> str:
     c = county.replace("'","''").upper()
     return f"UPPER(county) LIKE '%{c}%'"
+
+
+def load_training_imagery_years(csv_path: Path) -> Dict[str, int]:
+    """Load training county to imagery year mapping from CSV.
+    
+    CSV format: County,Data Year (e.g., "Bartholomew,21")
+    Converts 2-digit years to 4-digit (21 -> 2021, 23 -> 2023).
+    
+    Args:
+        csv_path: Path to training_county_imagery_years.csv
+        
+    Returns:
+        Dict mapping county name -> 4-digit year (e.g., {"Bartholomew": 2021, "Benton": 2023})
+        
+    Raises:
+        FileNotFoundError: If CSV not found
+        ValueError: If CSV format invalid
+    """
+    import csv
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Imagery years CSV not found: {csv_path}")
+    
+    result = {}
+    with open(csv_path) as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or set(reader.fieldnames) != {"County", "Data Year"}:
+            raise ValueError(f"CSV must have exactly columns 'County' and 'Data Year', got: {reader.fieldnames}")
+        
+        for row in reader:
+            county_name = row["County"].strip().title()
+            year_str = row["Data Year"].strip()
+            
+            # Convert 2-digit year to 4-digit
+            year_int = int(year_str)
+            if year_int < 100:
+                year_int = 2000 + year_int
+            
+            result[county_name] = year_int
+    
+    return result
+
+
+def year_to_layer_id(year: int, session: requests.Session) -> Optional[Tuple[int, str]]:
+    """Map imagery year to feature server layer ID and name.
+    
+    Args:
+        year: 4-digit year (e.g., 2021)
+        session: requests session
+        
+    Returns:
+        Tuple (layer_id, layer_name) or None if year not found
+    """
+    layers = get_layers(session)
+    for lyr_year, lyr_id, lyr_name in layers:
+        if lyr_year == year:
+            return (lyr_id, lyr_name)
+    return None
+
+
+def get_tile_count(
+    session: requests.Session,
+    layer_url: str,
+    county: str,
+    pixel_size: str = "06 in."
+) -> int:
+    """Count 6-inch tiles for a county in a specific layer.
+    
+    Args:
+        session: requests session
+        layer_url: Feature server layer URL (e.g., SERVICE_URL/0)
+        county: County name
+        pixel_size: Pixel size filter (default "06 in.")
+        
+    Returns:
+        Total count of matching tiles (handles pagination)
+    """
+    where = county_where(county)
+    count = 0
+    offset = 0
+    
+    while True:
+        params = {
+            "where": where,
+            "outFields": "pixel_size",
+            "returnGeometry": "false",
+            "resultOffset": offset,
+            "resultRecordCount": 2000,
+            "f": "json"
+        }
+        r = session.get(f"{layer_url}/query", params=params, timeout=60)
+        r.raise_for_status()
+        js = r.json()
+        feats = js.get("features", [])
+        
+        # Count features matching pixel_size filter
+        count += sum(1 for f in feats if f.get("attributes", {}).get("pixel_size", "") == pixel_size)
+        
+        if not feats or not js.get("exceededTransferLimit"):
+            break
+        offset += len(feats)
+    
+    return count
+
+
+def find_complete_imagery_year(
+    session: requests.Session,
+    county: str,
+    min_year: int = 2020
+) -> Tuple[int, int, int, str]:
+    """Find the most recent year with a complete tile set for a county.
+    
+    Completeness determined by tile count: selects most recent year where 
+    tile count equals the maximum seen (indicating full coverage from that year).
+    
+    Args:
+        session: requests session
+        county: County name
+        min_year: Minimum year to check (default 2020)
+        
+    Returns:
+        Tuple (selected_year, tile_count, layer_id, layer_name)
+        
+    Raises:
+        RuntimeError: If no complete year found or no 6-inch tiles found for county
+    """
+    layers = get_layers(session)
+    if not layers:
+        raise RuntimeError("No Footprint_YYYY layers found")
+    
+    # Collect tile counts per year (newest to oldest)
+    year_counts = {}
+    for year, layer_id, layer_name in layers:
+        if year < min_year:
+            break
+        
+        layer_url = f"{SERVICE_URL}/{layer_id}"
+        count = get_tile_count(session, layer_url, county)
+        year_counts[year] = (count, layer_id, layer_name)
+    
+    if not year_counts:
+        raise RuntimeError(f"No layers found after year {min_year}")
+    
+    # Find max count
+    max_count = max(count for count, _, _ in year_counts.values())
+    if max_count == 0:
+        raise RuntimeError(f"No 6-inch tiles found for county {county} in years {min_year}+")
+    
+    # Return most recent year with max count
+    for year in sorted(year_counts.keys(), reverse=True):
+        count, layer_id, layer_name = year_counts[year]
+        if count == max_count:
+            return (year, count, layer_id, layer_name)
+
+
+def survey_training_crs(
+    counties: List[str],
+    session: requests.Session,
+    imagery_years_csv: Path
+) -> Tuple[str, Dict[str, int]]:
+    """Survey training counties to determine most common CRS.
+    
+    Samples one 6-inch tile from each training county and queries its remote CRS.
+    Returns the most common CRS and the full distribution.
+    
+    Args:
+        counties: List of training county names
+        session: requests session
+        imagery_years_csv: Path to training_county_imagery_years.csv
+        
+    Returns:
+        Tuple (reference_crs_string, {crs: count, ...}) - e.g., ("EPSG:2968", {"EPSG:2968": 18, "EPSG:2967": 4})
+        
+    Raises:
+        RuntimeError: If unable to determine CRS for training data
+    """
+    imagery_years = load_training_imagery_years(imagery_years_csv)
+    crs_counts = {}
+    
+    print(f"\n[CRS Survey] Sampling {len(counties)} training counties...")
+    
+    for county in tqdm(counties, desc="CRS survey", unit="county"):
+        if county not in imagery_years:
+            print(f"  ⚠ {county}: Not in imagery_years CSV, skipping")
+            continue
+        
+        try:
+            year = imagery_years[county]
+            layer_info = year_to_layer_id(year, session)
+            if not layer_info:
+                print(f"  ⚠ {county} ({year}): Layer not found, skipping")
+                continue
+            
+            layer_id, layer_name = layer_info
+            layer_url = f"{SERVICE_URL}/{layer_id}"
+            
+            # Get sample tile
+            attrs = fetch_attrs(session, layer_url, county_where(county))
+            six_inch = [a for a in attrs if a.get("pixel_size") == "06 in." and a.get("url_tif")]
+            
+            if not six_inch:
+                print(f"  ⚠ {county} ({year}): No 6-inch tiles found, skipping")
+                continue
+            
+            # Query CRS of first tile
+            sample_url = six_inch[0]["url_tif"]
+            crs = get_remote_crs(sample_url)
+            crs_counts[crs] = crs_counts.get(crs, 0) + 1
+            
+        except Exception as e:
+            print(f"  ✗ {county}: {str(e)}")
+    
+    if not crs_counts:
+        raise RuntimeError("Unable to determine CRS from any training county")
+    
+    # Find most common CRS
+    reference_crs = max(crs_counts, key=crs_counts.get)
+    print(f"\n[CRS Survey] Selected reference CRS: {reference_crs}")
+    print(f"[CRS Survey] Distribution: {', '.join(f'{crs}({cnt})' for crs, cnt in sorted(crs_counts.items(), key=lambda x: -x[1]))}\n")
+    
+    return reference_crs, crs_counts
 
 
 def fetch_all_indiana_counties(session: requests.Session) -> List[str]:
@@ -524,12 +775,16 @@ def download_one(url: str, dest: Path, session: requests.Session) -> str:
 
 # ---------------- public api ----------------
 
-def download_6in_tiles(county: str, max_workers: int = 16) -> Dict:
-    """
-    super-simple downloader:
-      - only 6-inch tiles
-      - saves to project_root/data/counties/[County]/tiles/
-      - global progress bar (file-based)
+def download_6in_tiles(county: str, max_workers: int = 16, imagery_year: Optional[int] = None) -> Dict:
+    """Download 6-inch tiles for a county.
+    
+    Args:
+        county: County name
+        max_workers: Thread pool size (default 16)
+        imagery_year: Specific year to download (if None, auto-detects most complete year)
+        
+    Returns:
+        Dict with download stats including 'year' showing which year was selected
     """
     s = make_session()
     root = project_root()
@@ -538,22 +793,36 @@ def download_6in_tiles(county: str, max_workers: int = 16) -> Dict:
     dest_dir = root / "data" / "counties" / county_dir / "tiles"
     ensure_dir(dest_dir)
 
-    # find newest year having the county
-    for year, layer_id, layer_name in get_layers(s):
+    # Determine which year to use
+    if imagery_year is not None:
+        # Strict mode: use specified year
+        year_layer = year_to_layer_id(imagery_year, s)
+        if not year_layer:
+            raise RuntimeError(f"Specified year {imagery_year} not available (Footprint_{imagery_year} layer not found)")
+        
+        layer_id, layer_name = year_layer
         layer_url = f"{SERVICE_URL}/{layer_id}"
         attrs = fetch_attrs(s, layer_url, county_where(county))
-
-        # filter: only 6-inch tiles
-        six = [
-            a for a in attrs
-            if a.get("pixel_size","") in ("06 in.")
-            and a.get("url_tif")
-        ]
-        if six:
-            tiles = six
-            break
+        
+        # Validate 6-inch tiles exist for this county in this year
+        six = [a for a in attrs if a.get("pixel_size") == "06 in." and a.get("url_tif")]
+        if not six:
+            raise RuntimeError(f"No 6-inch tiles found for {county} in year {imagery_year}")
+        
+        year = imagery_year
+        tiles = six
     else:
-        raise RuntimeError(f"no 6-inch tiles found for county {county}")
+        # Auto-detect mode: find most complete year
+        year, tile_count, layer_id, layer_name = find_complete_imagery_year(s, county)
+        layer_url = f"{SERVICE_URL}/{layer_id}"
+        attrs = fetch_attrs(s, layer_url, county_where(county))
+        
+        # Filter for 6-inch tiles
+        six = [a for a in attrs if a.get("pixel_size") == "06 in." and a.get("url_tif")]
+        if not six:
+            raise RuntimeError(f"Auto-detect failed: found {tile_count} tiles but none are 6-inch")
+        
+        tiles = six
 
     # build job list
     jobs = []
@@ -565,7 +834,8 @@ def download_6in_tiles(county: str, max_workers: int = 16) -> Dict:
 
     # progress bar
     downloaded = resumed = skipped = failed = 0
-    desc = f"{county_dir} 06in tiles ({year})"
+    year_source = "specified" if imagery_year is not None else "auto-detected"
+    desc = f"{county_dir} 06in tiles ({year}, {year_source})"
 
     with tqdm(total=len(jobs), unit="file", desc=desc) as pbar:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
@@ -591,6 +861,7 @@ def download_6in_tiles(county: str, max_workers: int = 16) -> Dict:
     return {
         "county": county,
         "year": year,
+        "year_source": year_source,
         "output_dir": str(dest_dir),
         "total": len(jobs),
         "downloaded": downloaded,
