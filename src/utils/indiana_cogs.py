@@ -457,7 +457,7 @@ def load_training_imagery_years(csv_path: Path) -> Dict[str, int]:
         raise FileNotFoundError(f"Imagery years CSV not found: {csv_path}")
     
     result = {}
-    with open(csv_path) as f:
+    with open(csv_path, encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         if not reader.fieldnames or set(reader.fieldnames) != {"County", "Data Year"}:
             raise ValueError(f"CSV must have exactly columns 'County' and 'Data Year', got: {reader.fieldnames}")
