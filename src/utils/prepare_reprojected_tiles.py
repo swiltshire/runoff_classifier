@@ -224,7 +224,36 @@ def ensure_canonical_tiles_for_counties(
     *,
     force: bool = False,
 ):
-    log(f"Preparing canonical tiles for {len(counties)} counties")
-    for county in counties:
-        ensure_canonical_tiles_for_county(county, force=force)
-    log("All requested counties processed")
+    """Ensure canonical tiles for multiple counties with checkpoint resume.
+    
+    Maintains a checkpoint file (.canonical_crs_fix_checkpoint) to track processed counties.
+    If interrupted, will resume from where it left off on next run.
+    """
+    checkpoint_file = project_root() / "outputs" / ".canonical_crs_fix_checkpoint"
+    
+    # Load already-processed counties
+    processed = set()
+    if checkpoint_file.exists():
+        processed = set(checkpoint_file.read_text().strip().split("\n"))
+    
+    # Filter to counties still needing processing
+    remaining = [c for c in counties if c not in processed]
+    
+    if not remaining:
+        log(f"All {len(counties)} counties already processed (checkpoint found)")
+        return
+    
+    log(f"Preparing canonical tiles for {len(counties)} counties ({len(remaining)} remaining)")
+    
+    for county in remaining:
+        try:
+            ensure_canonical_tiles_for_county(county, force=force)
+            # Mark as processed
+            processed.add(county)
+            checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+            checkpoint_file.write_text("\n".join(sorted(processed)))
+        except Exception as e:
+            log(f"ERROR processing {county}: {e}")
+            raise
+    
+    log(f"All requested counties processed")
