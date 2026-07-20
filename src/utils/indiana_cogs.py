@@ -789,7 +789,7 @@ def download_6in_tiles(county: str, max_workers: int = 16, imagery_year: Optiona
     s = make_session()
     root = project_root()
 
-    county_dir = safe_name(county.strip().title())
+    county_dir = safe_name(county.strip())
     dest_dir = root / "data" / "counties" / county_dir / "tiles"
     ensure_dir(dest_dir)
 
