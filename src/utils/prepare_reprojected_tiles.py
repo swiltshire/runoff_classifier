@@ -17,13 +17,21 @@ from utils.indiana_cogs import (
     download_6in_tiles,
     project_root,
     safe_name,
+    CANONICAL_CRS as DEFAULT_CANONICAL_CRS,
+    set_reference_crs,
 )
 
 # ---------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------
 
-CANONICAL_CRS = "EPSG:2968"          # Indiana West (ft)
+# Load persisted reference CRS from previous Phase 0 run, or use default
+CANONICAL_CRS = DEFAULT_CANONICAL_CRS
+_crs_config_file = project_root() / "outputs" / ".reference_crs"
+if _crs_config_file.exists():
+    CANONICAL_CRS = _crs_config_file.read_text().strip()
+    set_reference_crs(CANONICAL_CRS)
+
 CANONICAL_RES = "0.5 0.5"
 S3_BUCKET = "sagemaker-gst-stage.sharing"
 S3_PREFIX = "serge-wiltshire/runoff-classifier-data/reprojected_imagery"
