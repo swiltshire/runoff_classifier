@@ -223,11 +223,17 @@ def ensure_canonical_tiles_for_counties(
     counties: List[str],
     *,
     force: bool = False,
+    skip_counties: List[str] = None,
 ):
     """Ensure canonical tiles for multiple counties with checkpoint resume.
     
     Maintains a checkpoint file (.canonical_crs_fix_checkpoint) to track processed counties.
     If interrupted, will resume from where it left off on next run.
+    
+    Args:
+        counties: List of counties to process
+        force: Force re-check even if already uploaded to S3
+        skip_counties: Optional list of counties to mark as already-processed (useful for resuming)
     """
     checkpoint_file = project_root() / "outputs" / ".canonical_crs_fix_checkpoint"
     
@@ -235,6 +241,10 @@ def ensure_canonical_tiles_for_counties(
     processed = set()
     if checkpoint_file.exists():
         processed = set(checkpoint_file.read_text().strip().split("\n"))
+    
+    # Add manually-specified skip counties to checkpoint
+    if skip_counties:
+        processed.update(skip_counties)
     
     # Filter to counties still needing processing
     remaining = [c for c in counties if c not in processed]
