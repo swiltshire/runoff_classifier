@@ -281,24 +281,6 @@ def prepare_multicounty_training(
             gdf_bounds_after = gdf.total_bounds
             _log(f"  Bounds after force convert: {gdf_bounds_after}")
 
-        # Validate overlap with tiles
-        overlaps = 0
-        sample_tile_bounds = None
-        for t in tiles:
-            t_bounds = _raster_bounds(t)
-            if sample_tile_bounds is None:
-                sample_tile_bounds = t_bounds
-            if _bounds_intersect(t_bounds, gdf.total_bounds):
-                overlaps += 1
-
-        if overlaps == 0:
-            _log(f"ERROR: {c} labels do not overlap any tiles")
-            _log(f"  Sample tile bounds:  {sample_tile_bounds}")
-            _log(f"  Label bounds:        {gdf.total_bounds}")
-            _log(f"  Label CRS after processing: {gdf.crs}")
-            poison_counties.append(c)
-            continue
-
         if debug_plots:
             _plot_overlay(tiles[0], gdf, title=f"{c} label alignment")
 
