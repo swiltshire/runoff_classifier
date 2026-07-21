@@ -73,12 +73,50 @@ def _plot_overlay(raster_path: str, gdf: gpd.GeoDataFrame, title: str) -> None:
     with rasterio.open(raster_path) as ds:
         img = ds.read([1, 2, 3])
         transform = ds.transform
+        raster_crs = ds.crs
+        raster_bounds = ds.bounds
+        raster_res = ds.res
 
-    fig, ax = plt.subplots(figsize=(8, 8))
+    # Diagnostic output
+    print(f"\n[plot] Raster: {Path(raster_path).name}")
+    print(f"[plot]   CRS: {raster_crs}")
+    print(f"[plot]   Bounds: {raster_bounds}")
+    print(f"[plot]   Resolution: {raster_res}")
+    print(f"[plot] Labels:")
+    print(f"[plot]   CRS: {gdf.crs}")
+    print(f"[plot]   Total bounds: {gdf.total_bounds}")
+    print(f"[plot]   Num features: {len(gdf)}")
+
+    # Ensure labels are in same CRS as raster
+    gdf_plot = gdf.copy()
+    if gdf_plot.crs != raster_crs:
+        print(f"[plot]   Converting labels from {gdf_plot.crs} to {raster_crs}")
+        gdf_plot = gdf_plot.to_crs(raster_crs)
+        print(f"[plot]   Bounds after conversion: {gdf_plot.total_bounds}")
+
+    # Check overlap
+    raster_box = box(*raster_bounds)
+    gdf_box = box(*gdf_plot.total_bounds)
+    overlaps = raster_box.intersects(gdf_box)
+    print(f"[plot]   Spatial overlap: {overlaps}")
+    if overlaps:
+        intersection = raster_box.intersection(gdf_box)
+        print(f"[plot]   Intersection bounds: {intersection.bounds}")
+
+    fig, ax = plt.subplots(figsize=(10, 10))
     show(img, transform=transform, ax=ax)
-    gdf.plot(ax=ax, edgecolor="red", facecolor="none", linewidth=1)
-    ax.set_title(title)
+    gdf_plot.plot(ax=ax, edgecolor="red", facecolor="none", linewidth=2, alpha=0.8)
+    
+    # Set reasonable axis limits to show both raster and labels
+    ax.set_xlim(raster_bounds.left - 500, raster_bounds.right + 500)
+    ax.set_ylim(raster_bounds.bottom - 500, raster_bounds.top + 500)
+    
+    ax.set_title(title, fontsize=12, fontweight='bold')
+    ax.set_xlabel(f"X ({raster_crs})")
+    ax.set_ylabel(f"Y ({raster_crs})")
+    plt.tight_layout()
     plt.show()
+    print(f"[plot] Plot complete.\n")
 
 
 
