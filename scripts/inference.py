@@ -668,6 +668,13 @@ def main():
         logger.info("[debug] final area thresholding kept %d features (dropped %d under or over size threshhold)",
             post_count, pre_count - post_count)
 
+        # Filter out Background class from output
+        pre_bg_filter = len(merged)
+        merged = merged[merged["classname"] != "Background"].copy()
+        post_bg_filter = len(merged)
+        if pre_bg_filter > post_bg_filter:
+            logger.info("[debug] filtered out %d Background class features", pre_bg_filter - post_bg_filter)
+
         final_path = args.out_vector if args.out_vector.lower().endswith('.gpkg') else os.path.join(out_dir, base + '.gpkg')
         os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
         merged.to_file(final_path, driver="GPKG", layer=layer_name)
