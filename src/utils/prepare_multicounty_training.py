@@ -197,8 +197,23 @@ def prepare_multicounty_training(
         ref_bounds = ds.bounds
         ref_res = ds.res
 
-    _log(f"Target CRS: {target_crs}")
+    _log(f"Target CRS: {target_crs} (from first tile: {first_tile.name})")
     _log(f"Reference resolution: {ref_res}")
+    
+    # Sanity check: all tiles should be in same CRS
+    crs_counts = {}
+    for c in selected_counties:
+        for t in county_to_tiles[c][:1]:  # check first tile of each county
+            with rasterio.open(t) as ds:
+                crs_str = str(ds.crs)
+                crs_counts[crs_str] = crs_counts.get(crs_str, 0) + 1
+    
+    if len(crs_counts) > 1:
+        _log(f"WARNING: Tiles have mixed CRS!")
+        for crs_str, count in sorted(crs_counts.items()):
+            _log(f"  {crs_str}: {count} counties")
+    else:
+        _log(f"✓ All tiles in same CRS: {list(crs_counts.keys())[0]}")
 
     # -------------------------------------------------------------------------
     # Load + validate labels per county
@@ -238,16 +253,30 @@ def prepare_multicounty_training(
             continue
 
         if gdf.crs != target_crs:
+            _log(f"  Converting labels from {gdf.crs} to {target_crs}")
+            gdf_bounds_before = gdf.total_bounds
             gdf = gdf.to_crs(target_crs)
+            gdf_bounds_after = gdf.total_bounds
+            _log(f"  Bounds before conversion: {gdf_bounds_before}")
+            _log(f"  Bounds after conversion:  {gdf_bounds_after}")
+        else:
+            _log(f"  Labels already in {target_crs}")
 
         # Validate overlap with tiles
         overlaps = 0
+        sample_tile_bounds = None
         for t in tiles:
-            if _bounds_intersect(_raster_bounds(t), gdf.total_bounds):
+            t_bounds = _raster_bounds(t)
+            if sample_tile_bounds is None:
+                sample_tile_bounds = t_bounds
+            if _bounds_intersect(t_bounds, gdf.total_bounds):
                 overlaps += 1
 
         if overlaps == 0:
             _log(f"ERROR: {c} labels do not overlap any tiles")
+            _log(f"  Sample tile bounds:  {sample_tile_bounds}")
+            _log(f"  Label bounds:        {gdf.total_bounds}")
+            _log(f"  Label CRS after processing: {gdf.crs}")
             poison_counties.append(c)
             continue
 
