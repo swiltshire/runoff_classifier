@@ -284,15 +284,12 @@ def prepare_multicounty_training(
         # Validate overlap with tiles
         overlaps = 0
         sample_tile_bounds = None
-        overlapping_tile = None  # Track a tile that actually overlaps
         for t in tiles:
             t_bounds = _raster_bounds(t)
             if sample_tile_bounds is None:
                 sample_tile_bounds = t_bounds
             if _bounds_intersect(t_bounds, gdf.total_bounds):
                 overlaps += 1
-                if overlapping_tile is None:
-                    overlapping_tile = t  # Save first overlapping tile for plotting
 
         if overlaps == 0:
             _log(f"ERROR: {c} labels do not overlap any tiles")
@@ -303,7 +300,7 @@ def prepare_multicounty_training(
             continue
 
         if debug_plots:
-            _plot_overlay(overlapping_tile, gdf, title=f"{c} label alignment")
+            _plot_overlay(tiles[0], gdf, title=f"{c} label alignment")
 
         gdf["county"] = c
         gdfs.append(gdf)
