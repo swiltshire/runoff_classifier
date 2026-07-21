@@ -202,16 +202,21 @@ def prepare_multicounty_training(
     
     # Sanity check: all tiles should be in same CRS
     crs_counts = {}
+    crs_by_county = {}
     for c in selected_counties:
         for t in county_to_tiles[c][:1]:  # check first tile of each county
             with rasterio.open(t) as ds:
                 crs_str = str(ds.crs)
                 crs_counts[crs_str] = crs_counts.get(crs_str, 0) + 1
+                crs_by_county[c] = crs_str
     
     if len(crs_counts) > 1:
         _log(f"WARNING: Tiles have mixed CRS!")
         for crs_str, count in sorted(crs_counts.items()):
             _log(f"  {crs_str}: {count} counties")
+        _log(f"Per-county CRS mapping:")
+        for c in sorted(crs_by_county.keys()):
+            _log(f"  {c}: {crs_by_county[c]}")
     else:
         _log(f"✓ All tiles in same CRS: {list(crs_counts.keys())[0]}")
 
@@ -261,6 +266,17 @@ def prepare_multicounty_training(
             _log(f"  Bounds after conversion:  {gdf_bounds_after}")
         else:
             _log(f"  Labels already in {target_crs}")
+            gdf_bounds_after = gdf.total_bounds
+            _log(f"  Bounds: {gdf_bounds_after}")
+        
+        # Sanity check: bounds should be in feet (large numbers), not degrees (small numbers)
+        bounds_range = gdf_bounds_after[2] - gdf_bounds_after[0]  # max_x - min_x
+        if bounds_range < 1000:  # less than 1000 units = probably degrees, not feet
+            _log(f"WARNING: {c} bounds suspiciously small (range: {bounds_range}). May be in degrees instead of feet!")
+            _log(f"  Attempting to force convert to {target_crs}...")
+            gdf = gdf.to_crs(target_crs)
+            gdf_bounds_after = gdf.total_bounds
+            _log(f"  Bounds after force convert: {gdf_bounds_after}")
 
         # Validate overlap with tiles
         overlaps = 0
