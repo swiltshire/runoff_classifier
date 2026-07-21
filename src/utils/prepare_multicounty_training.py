@@ -107,9 +107,12 @@ def _plot_overlay(raster_path: str, gdf: gpd.GeoDataFrame, title: str) -> None:
     show(img, transform=transform, ax=ax)
     gdf_plot.plot(ax=ax, edgecolor="red", facecolor="none", linewidth=2, alpha=0.8)
     
-    # Set reasonable axis limits to show both raster and labels
-    ax.set_xlim(raster_bounds.left - 500, raster_bounds.right + 500)
-    ax.set_ylim(raster_bounds.bottom - 500, raster_bounds.top + 500)
+    # Set axis limits to show raster + labels (use larger bounds to see both)
+    all_bounds = box(*raster_bounds).union(box(*gdf_plot.total_bounds)).bounds
+    margin = max(500, (all_bounds[2] - all_bounds[0]) * 0.1)  # 10% margin or 500 units, whichever is larger
+    
+    ax.set_xlim(all_bounds[0] - margin, all_bounds[2] + margin)
+    ax.set_ylim(all_bounds[1] - margin, all_bounds[3] + margin)
     
     ax.set_title(title, fontsize=12, fontweight='bold')
     ax.set_xlabel(f"X ({raster_crs})")
