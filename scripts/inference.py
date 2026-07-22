@@ -32,7 +32,7 @@ if PROJECT_ROOT not in sys.path:
 
 from src.models.model import build_fasterrcnn_model, build_maskrcnn_model
 from src.utils.tiling import make_grid_windows, adjust_boxes_to_global
-from src.utils.fast_mask import get_mask_clipped, filter_windows_by_mask_raster
+from src.utils.fast_mask import get_mask_clipped, filter_windows_by_mask_raster, clear_mask_cache
 from src.utils.make_vrt import write_mosaic_vrt
 
 # ---------------------------
@@ -112,6 +112,7 @@ def resolve_raster_input(path_or_dir):
         parent_name = os.path.basename(parent)
         out_vrt = os.path.join(parent, f"{parent_name}_mosaic.vrt")
         write_mosaic_vrt(out_vrt, files)
+        clear_mask_cache(out_vrt, os.path.dirname(out_vrt))
         return out_vrt
 
     if any(ch in path_or_dir for ch in ["*", "?", "["]):
@@ -123,6 +124,7 @@ def resolve_raster_input(path_or_dir):
         parent_name = os.path.basename(parent)
         out_vrt = os.path.join(parent, f"{parent_name}_mosaic.vrt")
         write_mosaic_vrt(out_vrt, files)
+        clear_mask_cache(out_vrt, os.path.dirname(out_vrt))
         return out_vrt
 
     return path_or_dir

@@ -15,6 +15,29 @@ from rasterio.windows import Window
 from shapely.geometry import box
 
 
+def clear_mask_cache(raster_path: str, cache_dir: str, downsample: int = 16):
+    """
+    Clear cached AOI mask files for a given raster.
+    Called when VRT is regenerated to prevent spatial misalignment.
+    """
+    logger = logging.getLogger("mask_raster")
+    base = os.path.splitext(os.path.basename(raster_path))[0]
+    tag = f"_mask_ds{downsample}_clipped"
+    mask_path_npy = os.path.join(cache_dir, base + tag + ".npy")
+    meta_path_json = os.path.join(cache_dir, base + tag + ".json")
+    
+    cleared = False
+    if os.path.exists(mask_path_npy):
+        os.remove(mask_path_npy)
+        cleared = True
+    if os.path.exists(meta_path_json):
+        os.remove(meta_path_json)
+        cleared = True
+    
+    if cleared:
+        logger.info("[mask] cleared cache for %s", base)
+
+
 def get_mask_clipped(
     raster_path: str,
     mask_path: str,
