@@ -111,8 +111,7 @@ def resolve_raster_input(path_or_dir):
         parent = os.path.dirname(os.path.abspath(path_or_dir))
         parent_name = os.path.basename(parent)
         out_vrt = os.path.join(parent, f"{parent_name}_mosaic.vrt")
-        if not os.path.exists(out_vrt):
-            write_mosaic_vrt(out_vrt, files)
+        write_mosaic_vrt(out_vrt, files)
         return out_vrt
 
     if any(ch in path_or_dir for ch in ["*", "?", "["]):
@@ -123,8 +122,7 @@ def resolve_raster_input(path_or_dir):
         parent = os.path.dirname(tile_dir)
         parent_name = os.path.basename(parent)
         out_vrt = os.path.join(parent, f"{parent_name}_mosaic.vrt")
-        if not os.path.exists(out_vrt):
-            write_mosaic_vrt(out_vrt, files)
+        write_mosaic_vrt(out_vrt, files)
         return out_vrt
 
     return path_or_dir
