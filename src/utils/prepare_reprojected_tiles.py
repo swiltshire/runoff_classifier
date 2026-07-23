@@ -1,6 +1,7 @@
 # utils/prepare_reprojected_tiles.py
 
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -130,6 +131,7 @@ def process_one_tile(
         "skipped": 0,
         "reprojected": 0,
         "uploaded": 0,
+        "replaced_local": 0,
     }
 
     if not force and s3_exists(S3_BUCKET, s3_key):
@@ -139,14 +141,21 @@ def process_one_tile(
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
         out_tile = tile
+        was_reprojected = False
 
         if needs_reprojection(tile):
             out_tile = tmpdir / tile_name
             gdal_reproject(tile, out_tile)
             stats["reprojected"] = 1
+            was_reprojected = True
 
         upload_to_s3(out_tile, S3_BUCKET, s3_key)
         stats["uploaded"] = 1
+
+        # Replace local tile with reprojected version (before temp cleanup)
+        if was_reprojected:
+            shutil.copy2(out_tile, tile)
+            stats["replaced_local"] = 1
 
     return stats
 
@@ -182,6 +191,7 @@ def ensure_canonical_tiles_for_county(
     log(f"  Using {workers} parallel workers")
 
     desc = f"{county_safe} 06in → canonical"
+    replaced_local = 0
 
     with tqdm(total=len(local_tiles), unit="tile", desc=desc) as pbar:
         with ProcessPoolExecutor(max_workers=workers) as executor:
@@ -201,12 +211,14 @@ def ensure_canonical_tiles_for_county(
                 skipped += result["skipped"]
                 reprojected += result["reprojected"]
                 uploaded += result["uploaded"]
+                replaced_local += result["replaced_local"]
 
                 pbar.update(1)
                 pbar.set_postfix(
                     skip=skipped,
                     reproj=reprojected,
                     upload=uploaded,
+                    repl=replaced_local,
                 )
 
     elapsed = fmt_time(time.time() - start)
@@ -216,6 +228,7 @@ def ensure_canonical_tiles_for_county(
         f"skipped={skipped}, "
         f"reprojected={reprojected}, "
         f"uploaded={uploaded}, "
+        f"replaced_local={replaced_local}, "
         f"elapsed={elapsed}"
     )
 
