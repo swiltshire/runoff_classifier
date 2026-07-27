@@ -122,6 +122,82 @@ def _plot_overlay(raster_path: str, gdf: gpd.GeoDataFrame, title: str) -> None:
     print(f"[plot] Plot complete.\n")
 
 
+def _filter_singleclass_labels(
+    gdf: gpd.GeoDataFrame,
+    focus_class: str,
+) -> gpd.GeoDataFrame:
+    """
+    Filter merged labels for single-class training with 50/50 hard/easy negatives.
+    
+    Strategy:
+    - Keep: focus_class (all examples)
+    - Background (50%): all non-focus classes that are NOT "Background" (hard negatives - wrong class)
+    - Background (50%): all existing "Background" class entries (easy negatives - unverified or truly negative)
+    
+    Parameters
+    ----------
+    gdf : GeoDataFrame
+        Merged labels with 'Classname' column
+    focus_class : str
+        Target class name (e.g., 'Tile_Outlet')
+    
+    Returns
+    -------
+    GeoDataFrame
+        Filtered labels with only focus_class and Background classes
+    """
+    
+    gdf = gdf.copy()
+    
+    # Validate focus_class exists
+    if focus_class not in gdf["Classname"].unique():
+        _fail(f"Focus class '{focus_class}' not found in labels. Available: {gdf['Classname'].unique()}")
+    
+    # Separate focus class
+    focus = gdf[gdf["Classname"] == focus_class].copy()
+    
+    # Separate hard negatives (other classes, not Background)
+    hard_negatives = gdf[(gdf["Classname"] != focus_class) & (gdf["Classname"] != "Background")].copy()
+    
+    # Easy negatives (already Background)
+    easy_negatives = gdf[gdf["Classname"] == "Background"].copy()
+    
+    _log(f"  {focus_class}: {len(focus)} examples")
+    _log(f"  Hard negatives (other classes): {len(hard_negatives)} examples")
+    _log(f"  Easy negatives (Background): {len(easy_negatives)} examples")
+    
+    # 50/50 split for negatives
+    n_hard = len(hard_negatives)
+    n_easy = len(easy_negatives)
+    
+    if n_hard == 0 and n_easy == 0:
+        _fail(f"No negative examples available for {focus_class} training")
+    
+    if n_hard == 0:
+        _log(f"  WARNING: No other classes available; using only Background")
+        background = easy_negatives
+    elif n_easy == 0:
+        _log(f"  WARNING: No Background examples; using only other classes")
+        background = hard_negatives
+    else:
+        # Standard 50/50 split: use max count to avoid data loss
+        target_count = max(n_hard, n_easy)
+        hard_sample = hard_negatives.sample(n=min(target_count, n_hard), replace=True, random_state=42)
+        easy_sample = easy_negatives.sample(n=min(target_count, n_easy), replace=True, random_state=42)
+        background = pd.concat([hard_sample, easy_sample], ignore_index=True)
+    
+    # Assign classes
+    focus["Classname"] = focus_class
+    background["Classname"] = "Background"
+    
+    # Combine and return
+    result = pd.concat([focus, background], ignore_index=True)
+    result = gpd.GeoDataFrame(result, geometry="geometry", crs=gdf.crs)
+    
+    _log(f"  Final: {len(focus)} {focus_class} + {len(background)} Background = {len(result)} total")
+    
+    return result
+
 
 # -----------------------------------------------------------------------------
 # Main entry point
@@ -135,12 +211,15 @@ def prepare_multicounty_training(
     *,
     verified_only: bool = True,
     debug_plots: bool = False,
+    single_class: bool = False,
+    focus_class: str = None,
 ) -> None:
     """
     Prepare a multi-county training dataset:
       - merge shapefiles
       - validate alignment
       - build a training VRT
+      - optionally filter for single-class training with 50/50 hard/easy negatives
 
     Parameters
     ----------
@@ -156,6 +235,10 @@ def prepare_multicounty_training(
         Keep only VerifiedTr == 1 if the column exists
     debug_plots : bool
         Show raster/label overlay plots for each county
+    single_class : bool
+        If True, filter labels for single-class training (requires focus_class)
+    focus_class : str
+        Target class for single-class training (e.g., 'Tile_Outlet')
     """
 
     county_data_dir = Path(county_data_dir)
@@ -306,7 +389,23 @@ def prepare_multicounty_training(
 
     # Sanity: class distribution
     if "Classname" in merged.columns:
-        _log("Class distribution:")
+        _log("Class distribution before filtering:")
+        print(merged["Classname"].value_counts())
+
+    # -------------------------------------------------------------------------
+    # Single-class filtering (optional)
+    # -------------------------------------------------------------------------
+    
+    if single_class:
+        if not focus_class:
+            _fail("single_class=True requires focus_class parameter")
+        
+        _log(f"\nFiltering for single-class training: focus_class='{focus_class}'")
+        _log(f"Using 50/50 hard/easy negatives strategy")
+        
+        merged = _filter_singleclass_labels(merged, focus_class=focus_class)
+        
+        _log("Single-class filtering complete. Final class distribution:")
         print(merged["Classname"].value_counts())
 
     # -------------------------------------------------------------------------
