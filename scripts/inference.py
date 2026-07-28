@@ -679,7 +679,7 @@ def main():
         os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
         merged.to_file(final_path, driver="GPKG", layer=layer_name)
         logger.info("[done] wrote %d features → %s (elapsed %.2fs)",
-                    post_count, final_path, time.time() - t0)
+                    post_bg_filter, final_path, time.time() - t0)
 
 
     if dist.is_initialized():
