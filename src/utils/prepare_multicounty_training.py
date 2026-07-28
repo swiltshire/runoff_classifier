@@ -125,14 +125,16 @@ def _plot_overlay(raster_path: str, gdf: gpd.GeoDataFrame, title: str) -> None:
 def _filter_singleclass_labels(
     gdf: gpd.GeoDataFrame,
     focus_class: str,
+    background_ratio: int = 50,
+    remove_overlaps: bool = True,
 ) -> gpd.GeoDataFrame:
     """
-    Filter merged labels for single-class training with 50/50 hard/easy negatives.
+    Filter merged labels for single-class training with tunable hard/easy negatives ratio.
     
     Strategy:
-    - Keep: focus_class (all examples)
-    - Background (50%): all non-focus classes that are NOT "Background" (hard negatives - wrong class)
-    - Background (50%): all existing "Background" class entries (easy negatives - unverified or truly negative)
+    - Keep: focus_class (all examples, optionally with overlaps removed)
+    - Background: split between hard negatives (other classes) and easy negatives (unverified)
+      using background_ratio to control the split
     
     Parameters
     ----------
@@ -140,6 +142,14 @@ def _filter_singleclass_labels(
         Merged labels with 'Classname' column
     focus_class : str
         Target class name (e.g., 'Tile_Outlet')
+    background_ratio : int
+        Percentage of background to be hard negatives (other classes). Default 50.
+        - 50: equal split between hard and easy negatives
+        - 80: 80% hard negatives, 20% easy negatives
+        - 20: 20% hard negatives, 80% easy negatives
+    remove_overlaps : bool
+        If True, remove any non-focus-class features that overlap with focus_class features.
+        This prevents conflicting training signals in overlap zones. Default True.
     
     Returns
     -------
@@ -156,17 +166,40 @@ def _filter_singleclass_labels(
     # Separate focus class
     focus = gdf[gdf["Classname"] == focus_class].copy()
     
+    # Remove overlaps: exclude any non-focus feature that overlaps with a focus feature
+    n_removed_overlaps = 0
+    if remove_overlaps and len(focus) > 0:
+        # Union all focus geometries to create a single polygon
+        focus_union = focus.unary_union
+        
+        # Get all non-focus features
+        non_focus = gdf[gdf["Classname"] != focus_class].copy()
+        
+        # Mark features that DO NOT overlap with focus
+        non_overlapping = ~non_focus.geometry.intersects(focus_union)
+        n_removed_overlaps = (~non_overlapping).sum()
+        
+        # Keep only non-overlapping non-focus features
+        other_features = non_focus[non_overlapping].copy()
+        
+        if n_removed_overlaps > 0:
+            _log(f"  Removed {n_removed_overlaps} non-{focus_class} features that overlap with {focus_class}")
+    else:
+        other_features = gdf[gdf["Classname"] != focus_class].copy()
+    
     # Separate hard negatives (other classes, not Background)
-    hard_negatives = gdf[(gdf["Classname"] != focus_class) & (gdf["Classname"] != "Background")].copy()
+    hard_negatives = other_features[other_features["Classname"] != "Background"].copy()
     
     # Easy negatives (already Background)
-    easy_negatives = gdf[gdf["Classname"] == "Background"].copy()
+    easy_negatives = other_features[other_features["Classname"] == "Background"].copy()
     
     _log(f"  {focus_class}: {len(focus)} examples")
-    _log(f"  Hard negatives (other classes): {len(hard_negatives)} examples")
+    _log(f"  Hard negatives (other classes, non-overlapping): {len(hard_negatives)} examples")
     _log(f"  Easy negatives (Background): {len(easy_negatives)} examples")
+    if n_removed_overlaps > 0:
+        _log(f"  Overlaps removed: {n_removed_overlaps}")
     
-    # 50/50 split for negatives
+    # Combine hard and easy negatives using background_ratio
     n_hard = len(hard_negatives)
     n_easy = len(easy_negatives)
     
@@ -180,11 +213,41 @@ def _filter_singleclass_labels(
         _log(f"  WARNING: No Background examples; using only other classes")
         background = hard_negatives
     else:
-        # Standard 50/50 split: use max count to avoid data loss
-        target_count = max(n_hard, n_easy)
-        hard_sample = hard_negatives.sample(n=min(target_count, n_hard), replace=True, random_state=42)
-        easy_sample = easy_negatives.sample(n=min(target_count, n_easy), replace=True, random_state=42)
+        # Split using background_ratio
+        # background_ratio is the percentage of hard negatives
+        # e.g., background_ratio=80 means 80% hard, 20% easy
+        hard_pct = background_ratio / 100.0
+        easy_pct = (100 - background_ratio) / 100.0
+        
+        # Target counts based on total focus class size
+        n_focus = len(focus)
+        n_total_negatives = int(n_focus * (100 - background_ratio) / background_ratio) if background_ratio > 0 else 0
+        
+        # Actually, simpler logic: sample from hard and easy proportionally
+        # If we want 80% hard and 20% easy negatives:
+        # Take as many hard as we have, take as many easy as we have
+        # Then sample proportionally
+        max_hard_available = n_hard
+        max_easy_available = n_easy
+        
+        # Determine target count: use total from both pools, then split
+        total_available = max_hard_available + max_easy_available
+        n_hard_target = int(total_available * hard_pct)
+        n_easy_target = int(total_available * easy_pct)
+        
+        # Adjust if one pool is depleted
+        if n_hard_target > max_hard_available:
+            n_hard_target = max_hard_available
+            n_easy_target = total_available - n_hard_target
+        if n_easy_target > max_easy_available:
+            n_easy_target = max_easy_available
+            n_hard_target = total_available - n_easy_target
+        
+        hard_sample = hard_negatives.sample(n=min(n_hard_target, n_hard), replace=True, random_state=42)
+        easy_sample = easy_negatives.sample(n=min(n_easy_target, n_easy), replace=True, random_state=42)
         background = pd.concat([hard_sample, easy_sample], ignore_index=True)
+        
+        _log(f"  Background split: {len(hard_sample)} hard ({hard_pct*100:.0f}%), {len(easy_sample)} easy ({easy_pct*100:.0f}%)")
     
     # Assign classes
     focus["Classname"] = focus_class
@@ -213,13 +276,14 @@ def prepare_multicounty_training(
     debug_plots: bool = False,
     single_class: bool = False,
     focus_class: str = None,
+    background_ratio: int = 50,
 ) -> None:
     """
     Prepare a multi-county training dataset:
       - merge shapefiles
       - validate alignment
       - build a training VRT
-      - optionally filter for single-class training with 50/50 hard/easy negatives
+      - optionally filter for single-class training with tunable hard/easy negatives ratio
 
     Parameters
     ----------
@@ -239,6 +303,11 @@ def prepare_multicounty_training(
         If True, filter labels for single-class training (requires focus_class)
     focus_class : str
         Target class for single-class training (e.g., 'Tile_Outlet')
+    background_ratio : int
+        For single-class mode: percentage of background to be hard negatives (other classes).
+        - 80 (default for single-class): 80% hard negatives, 20% easy negatives
+        - 50 (default for multi-class): 50/50 split
+        - 20: 20% hard negatives, 80% easy negatives
     """
 
     county_data_dir = Path(county_data_dir)
@@ -401,9 +470,15 @@ def prepare_multicounty_training(
             _fail("single_class=True requires focus_class parameter")
         
         _log(f"\nFiltering for single-class training: focus_class='{focus_class}'")
-        _log(f"Using 50/50 hard/easy negatives strategy")
+        _log(f"Using {background_ratio}% hard / {100-background_ratio}% easy negatives strategy")
+        _log(f"Removing overlaps: any non-{focus_class} features overlapping {focus_class} will be excluded")
         
-        merged = _filter_singleclass_labels(merged, focus_class=focus_class)
+        merged = _filter_singleclass_labels(
+            merged,
+            focus_class=focus_class,
+            background_ratio=background_ratio,
+            remove_overlaps=True,
+        )
         
         _log("Single-class filtering complete. Final class distribution:")
         print(merged["Classname"].value_counts())
