@@ -166,15 +166,19 @@ def _filter_singleclass_labels(
     
     gdf = gdf.copy()
     
+    # Ensure VerifiedTr column exists (some counties may not have it)
+    if "VerifiedTr" not in gdf.columns:
+        gdf["VerifiedTr"] = 1  # assume all verified if column missing
+    
     # Validate focus_class exists
     if focus_class not in gdf["Classname"].unique():
         _fail(f"Focus class '{focus_class}' not found in labels. Available: {gdf['Classname'].unique()}")
     
     # Separate confirmed positives (focus_class with VerifiedTr == 1)
-    confirmed_positive = gdf[(gdf["Classname"] == focus_class) & (gdf.get("VerifiedTr", 1) == 1)].copy()
+    confirmed_positive = gdf[(gdf["Classname"] == focus_class) & (gdf["VerifiedTr"] == 1)].copy()
     
     # In-class negatives: focus_class with VerifiedTr == 0 (misclassified examples)
-    in_class_negative = gdf[(gdf["Classname"] == focus_class) & (gdf.get("VerifiedTr", 1) == 0)].copy()
+    in_class_negative = gdf[(gdf["Classname"] == focus_class) & (gdf["VerifiedTr"] == 0)].copy()
     
     # Out-of-class negatives: other classes
     out_of_class_negative = gdf[(gdf["Classname"] != focus_class)].copy()
@@ -217,17 +221,22 @@ def _filter_singleclass_labels(
     n_in_class_target = int(n_negatives_target * in_class_pct)
     n_out_of_class_target = n_negatives_target - n_in_class_target
     
-    # Sample with replacement if needed
+    # Sample with replacement if needed, reallocating shortfalls between pools
     n_in_class_available = len(in_class_negative)
     n_out_of_class_available = len(out_of_class_negative)
     
     if n_in_class_available == 0 and n_out_of_class_available == 0:
         _fail(f"No negative examples available for {focus_class} training")
     
+    # Try to get in_class_target, then reallocate any shortfall to out_of_class_target
+    n_in_class_actual = min(n_in_class_target, n_in_class_available)
+    n_in_class_shortfall = max(0, n_in_class_target - n_in_class_available)
+    n_out_of_class_adjusted = n_out_of_class_target + n_in_class_shortfall
+    
     # Sample from each pool
     if n_in_class_available > 0:
         in_class_sample = in_class_negative.sample(
-            n=min(n_in_class_target, n_in_class_available),
+            n=n_in_class_actual,
             replace=(n_in_class_target > n_in_class_available),
             random_state=42
         )
@@ -235,9 +244,10 @@ def _filter_singleclass_labels(
         in_class_sample = gpd.GeoDataFrame(columns=in_class_negative.columns, crs=gdf.crs)
     
     if n_out_of_class_available > 0:
+        n_out_of_class_actual = min(n_out_of_class_adjusted, n_out_of_class_available)
         out_of_class_sample = out_of_class_negative.sample(
-            n=min(n_out_of_class_target, n_out_of_class_available),
-            replace=(n_out_of_class_target > n_out_of_class_available),
+            n=n_out_of_class_actual,
+            replace=(n_out_of_class_adjusted > n_out_of_class_available),
             random_state=42
         )
     else:
@@ -246,9 +256,18 @@ def _filter_singleclass_labels(
     # Combine negative samples
     background = pd.concat([in_class_sample, out_of_class_sample], ignore_index=True)
     
+    # Log actual composition (accounting for reallocations)
+    n_background_actual = len(background)
+    actual_in_class_pct = (len(in_class_sample) / n_background_actual * 100) if n_background_actual > 0 else 0
+    actual_out_of_class_pct = (len(out_of_class_sample) / n_background_actual * 100) if n_background_actual > 0 else 0
+    
     _log(f"  Negative pool target: {n_negatives_target} total")
-    _log(f"    In-class negatives (VerifiedTr=0): {len(in_class_sample)} ({in_class_pct*100:.0f}%)")
-    _log(f"    Out-of-class negatives (other classes): {len(out_of_class_sample)} ({out_of_class_pct*100:.0f}%)")
+    if n_in_class_shortfall > 0:
+        _log(f"    In-class negatives (VerifiedTr=0): {len(in_class_sample)} (requested {n_in_class_target}, only {n_in_class_available} available)")
+        _log(f"    Out-of-class negatives (other classes): {len(out_of_class_sample)} (reallocated {n_in_class_shortfall} from in-class shortfall)")
+    else:
+        _log(f"    In-class negatives (VerifiedTr=0): {len(in_class_sample)} ({actual_in_class_pct:.1f}%)")
+        _log(f"    Out-of-class negatives (other classes): {len(out_of_class_sample)} ({actual_out_of_class_pct:.1f}%)")
     
     # Assign classes
     confirmed_positive["Classname"] = focus_class
@@ -403,17 +422,20 @@ def prepare_multicounty_training(
         gdf = _normalize_class_column(gdf, county=c)
 
         # Handle verified labels: keep both positive and negative examples
+        # NOTE: Do NOT overwrite Classname for VerifiedTr=0. Keep original class labels so that
+        # single-class filtering can identify in-class negatives (e.g., Tile_Outlet with VerifiedTr=0)
         if verified_only and "VerifiedTr" in gdf.columns:
             # Keep rows where VerifiedTr is 0 (negative) or 1 (positive)
             gdf = gdf[gdf["VerifiedTr"].isin([0, 1])]
             
-            # Assign "Background" class to negative examples (VerifiedTr == 0)
-            gdf.loc[gdf["VerifiedTr"] == 0, "Classname"] = "Background"
-            
-            # Log class distribution for this county
+            # Log class distribution for this county (split by VerifiedTr)
             n_positives = (gdf["VerifiedTr"] == 1).sum()
             n_negatives = (gdf["VerifiedTr"] == 0).sum()
-            _log(f"  {c}: {n_positives} positive examples, {n_negatives} negative (Background) examples")
+            _log(f"  {c}: {n_positives} confirmed (VerifiedTr=1), {n_negatives} unconfirmed (VerifiedTr=0)")
+        elif verified_only:
+            # If no VerifiedTr column, assume all records are verified (VerifiedTr=1)
+            gdf["VerifiedTr"] = 1
+            _log(f"  {c}: no VerifiedTr column, assuming all {len(gdf)} examples are confirmed")
 
         if gdf.empty:
             _log(f"WARNING: {c} has zero usable labels")
