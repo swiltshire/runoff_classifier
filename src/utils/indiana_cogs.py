@@ -667,6 +667,68 @@ def survey_training_crs(
     return reference_crs, crs_counts
 
 
+def quick_reference_crs_from_county(
+    county: str,
+    session: requests.Session,
+    imagery_years_csv: Optional[Path] = None,
+) -> str:
+    """Fast alternative to `survey_training_crs()`: determine the reference
+    CRS by reading a single representative tile from one county, instead of
+    censusing every tile across every training county (which can take hours
+    for large training sets).
+
+    Correctness note: with the mosaic-then-reproject architecture (see
+    `prepare_reprojected_tiles.py`), the reference CRS choice is a pure
+    efficiency/convenience decision, not a correctness one - EVERY native-CRS
+    group (including one that already matches the chosen reference CRS) is
+    warped through the same `gdalwarp -t_srs` pipeline, so picking a CRS
+    that isn't the true county-wide majority just means a few more tiles get
+    warped instead of passed through unchanged. Use this when you're willing
+    to assume one county (e.g. the original reference county) is
+    representative and want to skip the full census.
+
+    Args:
+        county: county name to sample (e.g. "Benton")
+        session: requests session
+        imagery_years_csv: optional path to training_county_imagery_years.csv;
+            if provided and `county` has an entry, uses that pinned year
+            (consistent with the rest of the pipeline); otherwise auto-detects
+            the newest/most-complete year for `county`.
+
+    Returns:
+        CRS string, e.g. "EPSG:2968"
+
+    Raises:
+        RuntimeError: if no 6-inch tile / CRS can be found for `county`
+    """
+    imagery_years: Dict[str, int] = {}
+    if imagery_years_csv:
+        imagery_years_csv = Path(imagery_years_csv)
+        if imagery_years_csv.exists():
+            imagery_years = load_training_imagery_years(imagery_years_csv)
+
+    pinned_year = imagery_years.get(normalize_county_key(county))
+    if pinned_year is not None:
+        layer_info = year_to_layer_id(pinned_year, session)
+        if not layer_info:
+            raise RuntimeError(f"CSV specifies year {pinned_year} for {county} but Footprint_{pinned_year} layer not found")
+        layer_id, layer_name = layer_info
+        year = pinned_year
+    else:
+        year, _, layer_id, layer_name = find_complete_imagery_year(session, county)
+
+    layer_url = f"{SERVICE_URL}/{layer_id}"
+    attrs = fetch_attrs(session, layer_url, county_where(county))
+    six_inch = [a for a in attrs if a.get("pixel_size") == "06 in." and a.get("url_tif")]
+    if not six_inch:
+        raise RuntimeError(f"No 6-inch tiles found for {county} in year {year}")
+
+    sample_url = six_inch[0]["url_tif"]
+    crs = get_remote_crs(sample_url)
+    print(f"[Quick CRS] Sampled {county} ({year}, 1 of {len(six_inch)} tiles): {crs}")
+    return crs
+
+
 def fetch_all_indiana_counties(session: requests.Session) -> List[str]:
     """Query Indiana feature server for all available counties.
     
