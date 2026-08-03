@@ -16,6 +16,7 @@ from shapely.geometry import box
 import matplotlib.pyplot as plt
 
 from utils.make_vrt import write_mosaic_vrt
+from utils.indiana_cogs import project_root, CANONICAL_CRS as DEFAULT_CANONICAL_CRS
 
 
 # -----------------------------------------------------------------------------
@@ -362,45 +363,29 @@ def prepare_multicounty_training(
         if len(shp_files) > 1:
             _log(f"WARNING: multiple shapefiles in {cdir}, using {shp_files[0].name}")
 
-        tiles = sorted((cdir / "tiles").glob("*.tif"))
+        tiles = sorted((cdir / "canonical_tiles").glob("*.tif"))
         if not tiles:
-            _fail(f"No tiles found in {cdir}/tiles")
+            _fail(
+                f"No canonical tiles found in {cdir}/canonical_tiles. "
+                f"Run ensure_canonical_mosaic_for_counties() for this county first."
+            )
 
         county_to_shp[c] = shp_files[0]
         county_to_tiles[c] = tiles
 
     # -------------------------------------------------------------------------
-    # Establish target CRS from first tile
+    # Target CRS: the pipeline's canonical CRS (every canonical_tiles/ chip is
+    # already reprojected + resampled to this CRS by
+    # ensure_canonical_mosaic_for_counties(), so there is no need to sample or
+    # sanity-check individual tiles here).
     # -------------------------------------------------------------------------
 
-    first_tile = county_to_tiles[selected_counties[0]][0]
-    with rasterio.open(first_tile) as ds:
-        target_crs = ds.crs
-        ref_bounds = ds.bounds
-        ref_res = ds.res
+    target_crs = DEFAULT_CANONICAL_CRS
+    _crs_config_file = project_root() / "outputs" / ".reference_crs"
+    if _crs_config_file.exists():
+        target_crs = _crs_config_file.read_text().strip()
 
-    _log(f"Target CRS: {target_crs} (from first tile: {first_tile.name})")
-    _log(f"Reference resolution: {ref_res}")
-    
-    # Sanity check: all tiles should be in same CRS
-    crs_counts = {}
-    crs_by_county = {}
-    for c in selected_counties:
-        for t in county_to_tiles[c][:1]:  # check first tile of each county
-            with rasterio.open(t) as ds:
-                crs_str = str(ds.crs)
-                crs_counts[crs_str] = crs_counts.get(crs_str, 0) + 1
-                crs_by_county[c] = crs_str
-    
-    if len(crs_counts) > 1:
-        _log(f"WARNING: Tiles have mixed CRS!")
-        for crs_str, count in sorted(crs_counts.items()):
-            _log(f"  {crs_str}: {count} counties")
-        _log(f"Per-county CRS mapping:")
-        for c in sorted(crs_by_county.keys()):
-            _log(f"  {c}: {crs_by_county[c]}")
-    else:
-        _log(f"✓ All tiles in same CRS: {list(crs_counts.keys())[0]}")
+    _log(f"Target CRS: {target_crs} (pipeline canonical CRS)")
 
     # -------------------------------------------------------------------------
     # Load + validate labels per county
