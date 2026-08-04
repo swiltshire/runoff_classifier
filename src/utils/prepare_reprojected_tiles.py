@@ -16,29 +16,45 @@ New architecture:
      across the training set, and occasionally >1 CRS within a single
      county) are downloaded via `download_6in_tiles()` and kept pristine on
      local disk at `data/counties/{county}/tiles/` - nothing here overwrites
-     raw tiles in place anymore.
+     raw tiles in place anymore. Any raw tiles previously archived to our
+     own S3 bucket (see step 6) are restored first via
+     `restore_raw_tiles_from_archive()`, so a re-added county in an
+     already-processed CRS group doesn't need to re-fetch from Indiana's
+     ArcGIS REST service.
   2. ALL locally-available raw tiles (across every county ever downloaded,
      not just the counties requested in a given call) are grouped by native
      EPSG code, so every warp has the maximum possible spatial context.
-  3. For each native-CRS group, a mosaic VRT is built from every tile in
-     that group (`gdalbuildvrt`), then warped ONCE to the canonical
+  3. Native-CRS groups are processed ONE AT A TIME (not all at once), so at
+     most one group's raw tiles are ever resident on local disk
+     simultaneously. For each group: a mosaic VRT is built from every tile
+     in that group (`gdalbuildvrt`), then warped ONCE to the canonical
      CRS/resolution as a lazy "warped VRT" (`gdalwarp -of VRT`). Because the
      resampler always sees the full mosaic, there is no tile-edge starvation.
   4. A fixed-size, tap-aligned "canonical chip" grid - anchored at the
      global origin (0, 0) and independent of any tile's original boundary -
-     is used to crop real GeoTIFF chips out of the warped VRT
+     is used to crop real GeoTIFF chips out of that group's warped VRT
      (`gdal_translate -projwin`: pure extraction, no further resampling).
      Chips are cached in S3 + a local shared cache keyed by
      (epsg, row, col) - NOT by county or original tile name - so the same
      physical chip is reused for training and inference regardless of which
      counties happen to be requested in a given call.
-  5. Each requested county gets a local `canonical_tiles/` folder,
-     materialized as hardlinks (falling back to copies) into the shared
-     chip cache, filtered to the chips overlapping that county's own raw
-     tile extent. This keeps the rest of the pipeline (training VRT
-     assembly, inference, notebook widgets) working with a familiar
-     per-county folder layout without needing to know about the shared
-     cache.
+  5. Each chip is materialized immediately (inside the same worker that
+     crops/uploads it) as a hardlink (falling back to a copy) into every
+     requesting county's `canonical_tiles/` folder, then the shared local
+     staging copy is deleted right away. This keeps peak local disk usage
+     from the chip cache bounded to roughly "chips currently in flight"
+     rather than accumulating a second full local copy of the entire
+     (potentially multi-TB) canonical dataset. `canonical_tiles/` still
+     gives the rest of the pipeline (training VRT assembly, inference,
+     notebook widgets) a familiar per-county folder layout without needing
+     to know about the shared cache.
+  6. Once a native-CRS group's chips are fully generated and materialized,
+     that group's raw tiles are no longer needed locally for this run: they
+     are backed up to our own S3 bucket (`RAW_ARCHIVE_S3_PREFIX`), verified,
+     then deleted locally (`archive_and_prune_raw_tiles()`) before moving on
+     to the next group. This means raw tiles and canonical output never
+     both have to be fully resident on local disk at the same time - only
+     one CRS group's raw tiles plus the canonical output generated so far.
 
 Border invalidation: when a genuinely new county is added whose raw tiles
 fall into a CRS group that already has cached chips, any existing chip
@@ -88,11 +104,12 @@ if _crs_config_file.exists():
     set_reference_crs(CANONICAL_CRS)
 
 CANONICAL_RES = 0.5  # feet/pixel (6-inch imagery)
-CHIP_SIZE_PX = 4096  # ~2048 x 2048 ft per chip at 0.5 ft resolution
+CHIP_SIZE_PX = 8192  # ~4096 x 4096 ft per chip at 0.5 ft resolution
 BORDER_BUFFER_CHIPS = 1.0  # force-regen radius (in chips) around newly-added counties' tiles
 
 S3_BUCKET = "sagemaker-gst-stage.sharing"
 S3_PREFIX = "serge-wiltshire/runoff-classifier-data/canonical_mosaic"
+RAW_ARCHIVE_S3_PREFIX = "serge-wiltshire/runoff-classifier-data/raw_tile_archive"
 
 GDALBUILDVRT = "gdalbuildvrt"
 GDALWARP = "gdalwarp"
@@ -145,6 +162,75 @@ def upload_to_s3(local_path: Path, bucket: str, key: str):
 def download_from_s3(local_path: Path, bucket: str, key: str):
     local_path.parent.mkdir(parents=True, exist_ok=True)
     s3.download_file(bucket, key, str(local_path))
+
+# ---------------------------------------------------------------------
+# Raw tile S3 archive (backup-then-delete lifecycle, so raw tiles and
+# canonical output never both have to be fully resident on local disk at
+# the same time)
+# ---------------------------------------------------------------------
+
+def raw_tile_s3_key(county_safe: str, filename: str) -> str:
+    return f"{RAW_ARCHIVE_S3_PREFIX}/{county_safe}/{filename}"
+
+def restore_raw_tiles_from_archive(county_safe: str) -> int:
+    """Download any raw tiles already archived in S3 for this county into its
+    local tiles/ folder. Lets an incremental re-add of a county whose native
+    CRS group was previously processed (and its raw tiles pruned) restore
+    from our own S3 archive instead of re-fetching from Indiana's ArcGIS REST
+    service. download_6in_tiles()'s own download_one() already skips valid
+    existing local files by size/header, so this is a pure win - only the
+    lightweight attribute/metadata query still hits Indiana, not the bulk
+    tile bytes."""
+    prefix = f"{RAW_ARCHIVE_S3_PREFIX}/{county_safe}/"
+    dest_dir = project_root() / "data" / "counties" / county_safe / "tiles"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    restored = 0
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            filename = key[len(prefix):]
+            if not filename or "/" in filename:
+                continue
+            local_path = dest_dir / filename
+            if local_path.exists() and local_path.stat().st_size == obj["Size"]:
+                continue
+            s3.download_file(S3_BUCKET, key, str(local_path))
+            restored += 1
+    return restored
+
+def archive_and_prune_raw_tiles(tile_paths: List[Path]) -> None:
+    """Back up raw tiles to our own S3 bucket, verify the upload, then delete
+    the local copy - so a native-CRS group's raw tiles don't have to coexist
+    locally with the canonical output generated from them."""
+    verified: List[Path] = []
+    for tile_path in tile_paths:
+        county_safe = tile_path.parent.parent.name
+        key = raw_tile_s3_key(county_safe, tile_path.name)
+        local_size = tile_path.stat().st_size
+
+        if not s3_exists(S3_BUCKET, key):
+            upload_to_s3(tile_path, S3_BUCKET, key)
+
+        try:
+            head = s3.head_object(Bucket=S3_BUCKET, Key=key)
+            if head["ContentLength"] != local_size:
+                log(f"  \u26a0 WARNING: archive size mismatch for {tile_path.name} - not deleting local copy")
+                continue
+        except Exception as e:
+            log(f"  \u26a0 WARNING: could not verify archive for {tile_path.name} ({e}) - not deleting local copy")
+            continue
+
+        verified.append(tile_path)
+
+    for tile_path in verified:
+        try:
+            tile_path.unlink()
+        except OSError:
+            pass
+
+    log(f"  archived + pruned {len(verified)}/{len(tile_paths)} raw tiles")
 
 # ---------------------------------------------------------------------
 # Native tile CRS grouping (with a small on-disk cache per county tiles/
@@ -309,6 +395,7 @@ def _crop_and_cache_chip(job: Dict) -> Dict[str, int]:
     col = job["col"]
     warped_vrt_path = job["warped_vrt_path"]
     force = job["force"]
+    counties_needing_this_cell: List[str] = job["counties"]
 
     stats = {"skipped": 0, "generated": 0, "downloaded": 0}
     s3_key = chip_s3_key(epsg_code, row, col)
@@ -319,20 +406,43 @@ def _crop_and_cache_chip(job: Dict) -> Dict[str, int]:
             download_from_s3(local_path, S3_BUCKET, s3_key)
             stats["downloaded"] = 1
         stats["skipped"] = 1
-        return stats
+    else:
+        minx, miny, maxx, maxy = chip_bounds(row, col)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            GDAL_TRANSLATE, "-q",
+            "-projwin", str(minx), str(maxy), str(maxx), str(miny),
+            "-co", "COMPRESS=DEFLATE", "-co", "TILED=YES", "-co", "BIGTIFF=IF_SAFER",
+            str(warped_vrt_path), str(local_path),
+        ]
+        subprocess.check_call(cmd)
+        stats["generated"] = 1
+        upload_to_s3(local_path, S3_BUCKET, s3_key)
 
-    minx, miny, maxx, maxy = chip_bounds(row, col)
-    local_path.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [
-        GDAL_TRANSLATE, "-q",
-        "-projwin", str(minx), str(maxy), str(maxx), str(miny),
-        "-co", "COMPRESS=DEFLATE", "-co", "TILED=YES", "-co", "BIGTIFF=IF_SAFER",
-        str(warped_vrt_path), str(local_path),
-    ]
-    subprocess.check_call(cmd)
-    stats["generated"] = 1
+    # Materialize into every requesting county's canonical_tiles/ folder as a
+    # hardlink (falling back to a copy across filesystems) immediately, then
+    # drop the shared staging copy - S3 is the durable store; local disk
+    # should only transiently hold each chip long enough to link it out, not
+    # accumulate a second full local copy of the entire (potentially
+    # multi-TB) canonical dataset on top of the raw tiles. This bounds peak
+    # local disk usage from the chip cache to roughly "chips currently in
+    # flight" instead of "every chip ever generated".
+    for county_safe in counties_needing_this_cell:
+        county_dir = project_root() / "data" / "counties" / county_safe / "canonical_tiles"
+        county_dir.mkdir(parents=True, exist_ok=True)
+        dst = county_dir / local_path.name
+        if dst.exists():
+            dst.unlink()
+        try:
+            os.link(local_path, dst)
+        except OSError:
+            shutil.copy2(local_path, dst)
 
-    upload_to_s3(local_path, S3_BUCKET, s3_key)
+    try:
+        local_path.unlink()
+    except OSError:
+        pass
+
     return stats
 
 # ---------------------------------------------------------------------
@@ -392,6 +502,12 @@ def ensure_canonical_mosaic_for_counties(
         existed_before = tiles_dir.is_dir() and any(tiles_dir.glob("*.tif"))
         if not existed_before:
             new_counties_safe.append(county_safe)
+            # restore any previously-archived raw tiles from our own S3
+            # bucket first (fast/reliable) before falling back to Indiana's
+            # ArcGIS REST service for anything still missing.
+            restored = restore_raw_tiles_from_archive(county_safe)
+            if restored:
+                log(f"  {county}: restored {restored} raw tiles from S3 archive")
 
         pinned_year = imagery_years.get(normalize_county_key(county))
         if pinned_year is None:
@@ -439,81 +555,89 @@ def ensure_canonical_mosaic_for_counties(
 
     log(f"Requested counties span {len(relevant_epsgs)} native CRS group(s): {sorted(relevant_epsgs)}")
 
-    # 4. build/refresh the native + warped VRT for every relevant CRS group
-    #    (cheap/virtual - always rebuilt so it reflects the full current
-    #    local tile pool, including tiles from counties outside this call).
-    warped_vrts: Dict[str, Path] = {}
-    for epsg_code in sorted(relevant_epsgs):
-        group_tiles = all_groups.get(epsg_code, [])
-        if not group_tiles:
-            continue
-        log(f"  {epsg_code}: building native mosaic from {len(group_tiles)} tiles...")
-        native_vrt = build_native_vrt(epsg_code, group_tiles)
-        warped_vrts[epsg_code] = build_warped_vrt(native_vrt, epsg_code)
-
-    # 5. assemble the full chip job list (union of all requested counties'
-    #    needed cells), applying force where border-invalidation says so.
-    all_needed: Dict[str, Set[Tuple[int, int]]] = defaultdict(set)
-    for cells in county_needed_cells.values():
-        for (epsg_code, r, c) in cells:
-            all_needed[epsg_code].add((r, c))
-
-    jobs = []
-    for epsg_code, cells in all_needed.items():
-        if epsg_code not in warped_vrts:
-            continue
-        for (r, c) in cells:
-            is_forced = force or (r, c) in force_cells.get(epsg_code, set())
-            jobs.append({
-                "epsg": epsg_code,
-                "row": r,
-                "col": c,
-                "warped_vrt_path": warped_vrts[epsg_code],
-                "force": is_forced,
-            })
-
-    log(f"Chips needed: {len(jobs)} (force={force}, border-forced={sum(1 for j in jobs if j['force'])})")
-
-    generated = skipped = downloaded = 0
-    workers = max(1, min(max_workers, os.cpu_count() or 1))
-    with tqdm(total=len(jobs), unit="chip", desc="canonical chips") as pbar:
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(_crop_and_cache_chip, job) for job in jobs]
-            for fut in as_completed(futures):
-                result = fut.result()
-                generated += result["generated"]
-                skipped += result["skipped"]
-                downloaded += result["downloaded"]
-                pbar.update(1)
-                pbar.set_postfix(gen=generated, skip=skipped, dl=downloaded)
-
-    # 6. materialize each requested county's own canonical_tiles/ folder as
-    #    hardlinks (falling back to copies) into the shared chip cache,
-    #    filtered to that county's own needed cells.
-    result_paths: Dict[str, List[Path]] = {}
+    # 4. clear stale canonical_tiles/*.tif upfront (once, before any group's
+    #    jobs run) - workers materialize fresh hardlinks per-chip as their
+    #    group's batch completes below, rather than in one big pass at the
+    #    end, so this cleanup can't race against in-flight workers.
     for county_safe in counties_safe:
         county_dir = project_root() / "data" / "counties" / county_safe / "canonical_tiles"
         county_dir.mkdir(parents=True, exist_ok=True)
         for existing in county_dir.glob("*.tif"):
             existing.unlink()
 
-        linked = []
-        for (epsg_code, r, c) in county_needed_cells.get(county_safe, []):
-            src = chip_local_cache_path(epsg_code, r, c)
-            if not src.exists():
-                continue
-            dst = county_dir / src.name
-            try:
-                os.link(src, dst)
-            except OSError:
-                shutil.copy2(src, dst)
-            linked.append(dst)
-        result_paths[county_safe] = linked
+    # 5. assemble the full chip job list (union of all requested counties'
+    #    needed cells), applying force where border-invalidation says so,
+    #    and map each cell back to the county/counties that need it so
+    #    workers can materialize hardlinks directly.
+    all_needed: Dict[str, Set[Tuple[int, int]]] = defaultdict(set)
+    for cells in county_needed_cells.values():
+        for (epsg_code, r, c) in cells:
+            all_needed[epsg_code].add((r, c))
+
+    cell_to_counties: Dict[Tuple[str, int, int], List[str]] = defaultdict(list)
+    for county_safe, cells in county_needed_cells.items():
+        for cell in cells:
+            cell_to_counties[cell].append(county_safe)
+
+    # 6. process ONE native-CRS group at a time, end to end: build its
+    #    mosaic, crop+cache+materialize every chip it needs, then archive
+    #    that group's raw tiles to S3 and delete them locally before moving
+    #    to the next group. This keeps at most one group's raw tiles on
+    #    local disk at once instead of the full multi-group total.
+    generated = skipped = downloaded = 0
+    workers = max(1, min(max_workers, os.cpu_count() or 1))
+
+    for epsg_code in sorted(relevant_epsgs):
+        group_tiles = all_groups.get(epsg_code, [])
+        if not group_tiles:
+            continue
+
+        log(f"  {epsg_code}: building native mosaic from {len(group_tiles)} tiles...")
+        native_vrt = build_native_vrt(epsg_code, group_tiles)
+        warped_vrt = build_warped_vrt(native_vrt, epsg_code)
+
+        cells = all_needed.get(epsg_code, set())
+        jobs = []
+        for (r, c) in cells:
+            is_forced = force or (r, c) in force_cells.get(epsg_code, set())
+            jobs.append({
+                "epsg": epsg_code,
+                "row": r,
+                "col": c,
+                "warped_vrt_path": warped_vrt,
+                "force": is_forced,
+                "counties": cell_to_counties.get((epsg_code, r, c), []),
+            })
+
+        log(f"  {epsg_code}: chips needed: {len(jobs)} (force={force}, border-forced={sum(1 for j in jobs if j['force'])})")
+
+        with tqdm(total=len(jobs), unit="chip", desc=f"canonical chips {epsg_code}") as pbar:
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(_crop_and_cache_chip, job) for job in jobs]
+                for fut in as_completed(futures):
+                    result = fut.result()
+                    generated += result["generated"]
+                    skipped += result["skipped"]
+                    downloaded += result["downloaded"]
+                    pbar.update(1)
+                    pbar.set_postfix(gen=generated, skip=skipped, dl=downloaded)
+
+        # this group's chips are all generated/materialized - its raw tiles
+        # are no longer needed locally for this run. Back them up to S3 and
+        # free the space before starting the next group.
+        archive_and_prune_raw_tiles(group_tiles)
+
+    # 7. result_paths - workers already materialized hardlinks per-chip as
+    #    each group's jobs completed above, so just glob what's there.
+    result_paths: Dict[str, List[Path]] = {}
+    for county_safe in counties_safe:
+        county_dir = project_root() / "data" / "counties" / county_safe / "canonical_tiles"
+        result_paths[county_safe] = sorted(county_dir.glob("*.tif"))
 
     elapsed = fmt_time(time.time() - start)
     log(
-        f"Done: {len(jobs)} chips ({generated} generated, {skipped} skipped, "
-        f"{downloaded} downloaded from S3), elapsed={elapsed}"
+        f"Done: {generated} generated, {skipped} skipped, {downloaded} "
+        f"downloaded from S3, elapsed={elapsed}"
     )
 
     return result_paths
