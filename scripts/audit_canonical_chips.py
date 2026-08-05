@@ -118,6 +118,13 @@ def parse_args():
              "the current chip_size_px, to positively rule out a wrong-grid key collision "
              "(slower - opens each chip's header individually via GDAL /vsis3/)",
     )
+    parser.add_argument(
+        "--verify_orphan_dims", action="store_true",
+        help="also verify actual pixel dimensions of every ORPHAN chip. Distinguishes confirmed "
+             "old-grid stale chips (wrong dimensions - safe to delete) from correctly-sized "
+             "chips that just fall outside the current --counties needed-cell set (NOT stale, "
+             "do not delete without checking whether a broader county set needs them).",
+    )
     return parser.parse_args()
 
 
@@ -191,6 +198,28 @@ def main():
             with open(out_file, "w") as f:
                 f.write("\n".join(orphan_keys))
             print(f"  orphan keys written to {out_file} - review before deleting anything")
+
+        if args.verify_orphan_dims and orphan_keys:
+            print(f"  verifying pixel dimensions of {len(orphan_keys)} orphan chip(s) (expected {CHIP_SIZE_PX}x{CHIP_SIZE_PX})...", flush=True)
+            orphan_results = verify_chip_dims(orphan_keys, CHIP_SIZE_PX)
+            wrong_grid_orphans = [r for r in orphan_results if isinstance(r[1], int)]
+            error_orphans = [r for r in orphan_results if not isinstance(r[1], int)]
+            correct_dim_orphans = len(orphan_keys) - len(orphan_results)
+            print(f"  of {len(orphan_keys)} orphans: {correct_dim_orphans} are correctly-sized {CHIP_SIZE_PX}x{CHIP_SIZE_PX} "
+                  f"(NOT stale - just outside this run's needed cells), {len(wrong_grid_orphans)} confirmed wrong-dimension "
+                  f"(old-grid stale, safe to delete), {len(error_orphans)} failed to open")
+            if wrong_grid_orphans:
+                wg_file = os.path.join(args.out_dir, f"orphans_confirmed_wrong_grid_{epsg_num}.txt")
+                with open(wg_file, "w") as f:
+                    for key, w, h in wrong_grid_orphans:
+                        f.write(f"{key}\t{w}\t{h}\n")
+                print(f"  confirmed wrong-grid orphan keys written to {wg_file}")
+            if error_orphans:
+                err_file = os.path.join(args.out_dir, f"orphans_unreadable_{epsg_num}.txt")
+                with open(err_file, "w") as f:
+                    for key, err, _ in error_orphans:
+                        f.write(f"{key}\t{err}\n")
+                print(f"  unreadable orphan keys (investigate before deleting) written to {err_file}")
 
         if args.verify_dims:
             print(f"  verifying pixel dimensions of {len(present_keys)} present chip(s) (expected {CHIP_SIZE_PX}x{CHIP_SIZE_PX})...", flush=True)
