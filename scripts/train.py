@@ -163,7 +163,7 @@ def main():
             tile_size=args.tile_size,
             max_per_class=args.max_per_class,
             classname_field='Classname',
-            jitter=64,
+            jitter=max(1, args.tile_size // 8),
         )
         windows_json = [
             {"col_off": float(w.col_off), "row_off": float(w.row_off), "width": float(w.width), "height": float(w.height)}
