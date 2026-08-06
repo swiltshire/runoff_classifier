@@ -152,6 +152,7 @@ def _filter_singleclass_labels(
     positive_ratio: int = 80,
     in_class_ratio: int = 50,
     remove_overlaps: bool = True,
+    include_background: bool = True,
 ) -> gpd.GeoDataFrame:
     """
     Filter merged labels for single-class training with tunable positive/negative ratio.
@@ -170,22 +171,31 @@ def _filter_singleclass_labels(
         Target class name (e.g., 'Tile_Outlet')
     positive_ratio : int
         Percentage of training data that should be confirmed positives. Default 80.
+        Ignored when include_background=False.
         - 80: 80% confirmed focus_class, 20% negatives (in-class + out-of-class combined)
         - 50: 50/50 split between confirmed and negatives
         - 20: 20% confirmed, 80% negatives
     in_class_ratio : int
         Percentage of the negative pool that should be in-class negatives. Default 50.
+        Ignored when include_background=False.
         - 50: 50/50 split between in-class and out-of-class negatives
         - 80: 80% in-class (misclassified examples), 20% out-of-class
         - 20: 20% in-class, 80% out-of-class
     remove_overlaps : bool
         If True, remove any non-focus-class features that overlap with focus_class features.
         This prevents conflicting training signals in overlap zones. Default True.
+        Ignored when include_background=False (there's no negative pool to filter).
+    include_background : bool
+        If True (default), builds a negative/"Background" pool sized via positive_ratio/
+        in_class_ratio, matching prior behavior. If False, returns ONLY confirmed
+        positives (VerifiedTr==1 focus_class rows) — no Background class, no negatives
+        at all. positive_ratio/in_class_ratio/remove_overlaps are ignored in this case.
     
     Returns
     -------
     GeoDataFrame
-        Filtered labels with only focus_class and Background classes
+        Filtered labels with only focus_class (and Background, unless
+        include_background=False)
     """
     
     gdf = gdf.copy()
@@ -200,7 +210,15 @@ def _filter_singleclass_labels(
     
     # Separate confirmed positives (focus_class with VerifiedTr == 1)
     confirmed_positive = gdf[(gdf["Classname"] == focus_class) & (gdf["VerifiedTr"] == 1)].copy()
-    
+
+    if not include_background:
+        # Positives-only mode: no negative/Background sampling at all.
+        confirmed_positive["Classname"] = focus_class
+        result = gpd.GeoDataFrame(confirmed_positive, geometry="geometry", crs=gdf.crs)
+        _log(f"  include_background=False: {len(result)} confirmed {focus_class} only "
+             f"(no negatives/Background class)")
+        return result
+
     # In-class negatives: focus_class with VerifiedTr == 0 (misclassified examples)
     in_class_negative = gdf[(gdf["Classname"] == focus_class) & (gdf["VerifiedTr"] == 0)].copy()
     
@@ -324,6 +342,7 @@ def prepare_multicounty_training(
     focus_class: str = None,
     positive_ratio: int = 80,
     in_class_ratio: int = 50,
+    include_background: bool = True,
 ) -> None:
     """
     Prepare a multi-county training dataset:
@@ -365,6 +384,12 @@ def prepare_multicounty_training(
         - 50 (default): 50/50 split between in-class and out-of-class
         - 80: 80% in-class (misclassified), 20% out-of-class
         - 20: 20% in-class, 80% out-of-class
+        Ignored when include_background=False.
+    include_background : bool
+        For single-class mode: if True (default), builds a negative/Background pool
+        sized via positive_ratio/in_class_ratio. If False, keeps ONLY confirmed
+        positives (VerifiedTr==1 focus_class) — no Background class, no negatives at
+        all. positive_ratio/in_class_ratio are ignored in this case.
     """
 
     county_data_dir = Path(county_data_dir)
@@ -519,10 +544,14 @@ def prepare_multicounty_training(
         if not focus_class:
             _fail("single_class=True requires focus_class parameter")
         
-        _log(f"\nFiltering for single-class training: focus_class='{focus_class}'")
-        _log(f"Target ratio: {positive_ratio}% confirmed {focus_class}, {100-positive_ratio}% negatives")
-        _log(f"Negative composition: {in_class_ratio}% in-class (VerifiedTr=0), {100-in_class_ratio}% out-of-class")
-        _log(f"Removing overlaps: any out-of-class features overlapping confirmed {focus_class} will be excluded")
+        if include_background:
+            _log(f"\nFiltering for single-class training: focus_class='{focus_class}'")
+            _log(f"Target ratio: {positive_ratio}% confirmed {focus_class}, {100-positive_ratio}% negatives")
+            _log(f"Negative composition: {in_class_ratio}% in-class (VerifiedTr=0), {100-in_class_ratio}% out-of-class")
+            _log(f"Removing overlaps: any out-of-class features overlapping confirmed {focus_class} will be excluded")
+        else:
+            _log(f"\nFiltering for single-class training: focus_class='{focus_class}'")
+            _log(f"include_background=False: keeping ONLY confirmed {focus_class} (VerifiedTr=1), no Background class")
         
         merged = _filter_singleclass_labels(
             merged,
@@ -530,6 +559,7 @@ def prepare_multicounty_training(
             positive_ratio=positive_ratio,
             in_class_ratio=in_class_ratio,
             remove_overlaps=True,
+            include_background=include_background,
         )
         
         _log("Single-class filtering complete. Final class distribution:")
