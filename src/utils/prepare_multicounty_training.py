@@ -296,6 +296,7 @@ def prepare_multicounty_training(
     *,
     verified_only: bool = True,
     debug_plots: bool = False,
+    debug_plot_mode: str = "sample",
     single_class: bool = False,
     focus_class: str = None,
     positive_ratio: int = 80,
@@ -322,6 +323,10 @@ def prepare_multicounty_training(
         Keep only VerifiedTr == 1 if the column exists
     debug_plots : bool
         Show raster/label overlay plots for each county
+    debug_plot_mode : str
+        Only used when debug_plots is True. Controls how many tiles are plotted per county:
+        - "sample" (default): plot a single representative tile per county (current behavior)
+        - "all": plot every canonical tile for the county, one plot each
     single_class : bool
         If True, filter labels for single-class training (requires focus_class)
     focus_class : str
@@ -344,6 +349,9 @@ def prepare_multicounty_training(
 
     if not selected_counties:
         _fail("No counties selected")
+
+    if debug_plot_mode not in ("sample", "all"):
+        _fail(f"debug_plot_mode must be 'sample' or 'all', got {debug_plot_mode!r}")
 
     _log(f"Preparing training data for {len(selected_counties)} counties")
 
@@ -449,7 +457,11 @@ def prepare_multicounty_training(
             _log(f"  Bounds after force convert: {gdf_bounds_after}")
 
         if debug_plots:
-            _plot_overlay(tiles[0], gdf, title=f"{c} label alignment")
+            if debug_plot_mode == "all":
+                for tile in tiles:
+                    _plot_overlay(tile, gdf, title=f"{c} label alignment - {tile.name}")
+            else:
+                _plot_overlay(tiles[0], gdf, title=f"{c} label alignment")
 
         gdf["county"] = c
         gdfs.append(gdf)
