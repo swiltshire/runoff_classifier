@@ -3,12 +3,17 @@ One-time backfill: write S3 manifests (see write_county_manifest() in
 src/utils/prepare_reprojected_tiles.py) for counties that were already fully
 processed BEFORE that manifest-writing step existed.
 
-For counties whose raw tiles are still present locally, this just reuses the
-normal county_tiles_by_crs() + local rasterio.open() path. For counties whose
-raw tiles have already been archived+pruned (e.g. the fully-completed 2967
-training set), this reads each archived tile's bounds/CRS directly from S3 via
-GDAL's /vsis3/ driver (header-only reads - NOT a full download) instead of
-restoring the whole raw tile set locally first.
+Instead of recomputing grid cells from raw tile bounds, this just lists
+whatever is currently sitting in the county's local canonical_tiles/ folder.
+_crop_and_cache_chip() names each materialized local file identically to its
+S3 key's filename (chip_{epsg_num}_r{row}_c{col}.tif) - see
+src/utils/prepare_reprojected_tiles.py - so the local tileset directly tells
+us the exact (epsg_code, row, col) triples needed for the manifest, no bounds
+math or S3 archive reads required.
+
+Only works for counties whose canonical_tiles/ folder is still present
+locally (i.e. hasn't been cleaned up yet). For counties without local
+canonical_tiles/, this script logs a warning and skips them.
 
 Going forward, ensure_canonical_mosaic_for_counties() writes/refreshes each
 requested county's manifest automatically - this script only needs to be run
@@ -22,9 +27,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
-from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import List, Tuple
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC_ROOT = os.path.join(PROJECT_ROOT, "src")
@@ -32,21 +37,10 @@ for _p in (PROJECT_ROOT, SRC_ROOT):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import rasterio
-from rasterio.session import AWSSession
-
 from utils.indiana_cogs import project_root, safe_name  # noqa: E402
-from utils.prepare_reprojected_tiles import (  # noqa: E402
-    RAW_ARCHIVE_S3_PREFIX,
-    S3_BUCKET,
-    _bounds_to_canonical,
-    _raster_bounds_native,
-    county_tiles_by_crs,
-    grid_cells_for_bounds,
-    log,
-    s3,
-    write_county_manifest,
-)
+from utils.prepare_reprojected_tiles import S3_BUCKET, log, write_county_manifest  # noqa: E402
+
+CHIP_FILENAME_RE = re.compile(r"^chip_(\d+)_r(-?\d+)_c(-?\d+)\.tif$")
 
 
 def parse_args():
@@ -60,38 +54,21 @@ def parse_args():
     return parser.parse_args()
 
 
-def archived_tile_bounds_by_crs(county_safe: str) -> Dict[str, Tuple[float, float, float, float]]:
-    """For a county whose raw tiles have been archived+pruned, read each
-    archived tile's bounds/CRS directly from S3 via /vsis3/ (header-only -
-    does not download the full file), grouped by native EPSG, and return
-    {epsg_code: combined_bounds}."""
-    prefix = f"{RAW_ARCHIVE_S3_PREFIX}/{county_safe}/"
-    paginator = s3.get_paginator("list_objects_v2")
-    keys = []
-    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            if obj["Key"].lower().endswith(".tif"):
-                keys.append(obj["Key"])
+def cells_from_local_canonical_tiles(county_safe: str) -> List[Tuple[str, int, int]]:
+    """Parse (epsg_code, row, col) triples directly out of the filenames
+    already present in data/counties/{county_safe}/canonical_tiles/."""
+    tiles_dir = project_root() / "data" / "counties" / county_safe / "canonical_tiles"
+    if not tiles_dir.is_dir():
+        return []
 
-    bounds_by_epsg: Dict[str, List[float]] = {}  # epsg -> [minx, miny, maxx, maxy]
-    with rasterio.Env(session=AWSSession()):
-        for key in keys:
-            vsi_path = f"/vsis3/{S3_BUCKET}/{key}"
-            with rasterio.open(vsi_path) as ds:
-                if not ds.crs:
-                    continue
-                epsg_code = f"EPSG:{ds.crs.to_epsg()}"
-                b = ds.bounds
-                if epsg_code not in bounds_by_epsg:
-                    bounds_by_epsg[epsg_code] = [b.left, b.bottom, b.right, b.top]
-                else:
-                    cur = bounds_by_epsg[epsg_code]
-                    cur[0] = min(cur[0], b.left)
-                    cur[1] = min(cur[1], b.bottom)
-                    cur[2] = max(cur[2], b.right)
-                    cur[3] = max(cur[3], b.top)
-
-    return {epsg: tuple(b) for epsg, b in bounds_by_epsg.items()}
+    cells: List[Tuple[str, int, int]] = []
+    for path in tiles_dir.glob("*.tif"):
+        m = CHIP_FILENAME_RE.match(path.name)
+        if not m:
+            continue
+        epsg_num, row, col = m.groups()
+        cells.append((f"EPSG:{epsg_num}", int(row), int(col)))
+    return cells
 
 
 def main():
@@ -100,28 +77,10 @@ def main():
 
     for county in counties:
         county_safe = safe_name(county)
-        tiles_dir = project_root() / "data" / "counties" / county_safe / "tiles"
-        cells: List[Tuple[str, int, int]] = []
-
-        if tiles_dir.is_dir() and any(tiles_dir.glob("*.tif")):
-            log(f"{county}: raw tiles present locally, using county_tiles_by_crs()")
-            subgroups = county_tiles_by_crs(county_safe)
-            for epsg_code, tiles in subgroups.items():
-                native_bounds = _raster_bounds_native(tiles)
-                canon_bounds = _bounds_to_canonical(native_bounds, epsg_code, buffer_chips=0.0)
-                cells.extend((epsg_code, r, c) for (r, c) in grid_cells_for_bounds(canon_bounds))
-        else:
-            log(f"{county}: no local raw tiles - reading archived tile bounds from S3 (/vsis3/ header reads)...")
-            bounds_by_epsg = archived_tile_bounds_by_crs(county_safe)
-            if not bounds_by_epsg:
-                log(f"  \u26a0 WARNING: no local OR archived raw tiles found for {county} - skipping")
-                continue
-            for epsg_code, native_bounds in bounds_by_epsg.items():
-                canon_bounds = _bounds_to_canonical(native_bounds, epsg_code, buffer_chips=0.0)
-                cells.extend((epsg_code, r, c) for (r, c) in grid_cells_for_bounds(canon_bounds))
+        cells = cells_from_local_canonical_tiles(county_safe)
 
         if not cells:
-            log(f"  \u26a0 WARNING: no cells computed for {county} - manifest NOT written")
+            log(f"  \u26a0 WARNING: no local canonical_tiles/ found for {county} - manifest NOT written")
             continue
 
         key = write_county_manifest(county, county_safe, cells)
