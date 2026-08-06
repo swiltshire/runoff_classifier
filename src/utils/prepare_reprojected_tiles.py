@@ -159,6 +159,35 @@ def s3_exists(bucket: str, key: str) -> bool:
 def upload_to_s3(local_path: Path, bucket: str, key: str):
     s3.upload_file(str(local_path), bucket, key)
 
+def county_manifest_s3_key(county_safe: str) -> str:
+    return f"{S3_PREFIX}/manifests/{county_safe}.json"
+
+def write_county_manifest(county: str, county_safe: str, cells: List[Tuple[str, int, int]]) -> str:
+    """Upload a small JSON manifest listing every canonical chip S3 key a
+    single county needs (`{epsg_code, row, col}` triples -> full S3 keys via
+    chip_s3_key()). Lets a collaborator download just one county's chips
+    directly (e.g. via a PowerShell + AWS CLI script) without needing to
+    know anything about the native-CRS folder layout or replicate any of
+    the grid/CRS math in this file. Returns the S3 key the manifest was
+    written to."""
+    keys = sorted({chip_s3_key(epsg_code, row, col) for (epsg_code, row, col) in cells})
+    manifest = {
+        "county": county,
+        "bucket": S3_BUCKET,
+        "chip_size_px": CHIP_SIZE_PX,
+        "canonical_crs": CANONICAL_CRS,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "keys": keys,
+    }
+    key = county_manifest_s3_key(county_safe)
+    s3.put_object(
+        Bucket=S3_BUCKET,
+        Key=key,
+        Body=json.dumps(manifest, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+    return key
+
 def download_from_s3(local_path: Path, bucket: str, key: str):
     local_path.parent.mkdir(parents=True, exist_ok=True)
     s3.download_file(bucket, key, str(local_path))
@@ -633,6 +662,15 @@ def ensure_canonical_mosaic_for_counties(
     for county_safe in counties_safe:
         county_dir = project_root() / "data" / "counties" / county_safe / "canonical_tiles"
         result_paths[county_safe] = sorted(county_dir.glob("*.tif"))
+
+    # 8. write/refresh each requested county's S3 manifest (list of exact
+    #    chip S3 keys it needs) so a collaborator can fetch just that
+    #    county's chips directly, without needing to know the native-CRS
+    #    folder layout or replicate any grid/CRS math locally.
+    for county, county_safe in zip(counties, counties_safe):
+        cells = county_needed_cells.get(county_safe, [])
+        if cells:
+            write_county_manifest(county, county_safe, cells)
 
     elapsed = fmt_time(time.time() - start)
     log(
