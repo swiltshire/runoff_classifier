@@ -11,6 +11,7 @@ import pandas as pd
 import numpy as np
 import rasterio
 from rasterio.plot import show
+from rasterio.merge import merge as rio_merge
 from rasterio.coords import BoundingBox
 from shapely.geometry import box
 import matplotlib.pyplot as plt
@@ -69,17 +70,39 @@ def _bounds_intersect(a: BoundingBox, b: BoundingBox) -> bool:
     return box(*a).intersects(box(*b))
 
 
-def _plot_overlay(raster_path: str, gdf: gpd.GeoDataFrame, title: str) -> None:
-    """Plot raster with label overlays for debugging."""
-    with rasterio.open(raster_path) as ds:
-        img = ds.read([1, 2, 3])
-        transform = ds.transform
-        raster_crs = ds.crs
-        raster_bounds = ds.bounds
-        raster_res = ds.res
+def _plot_overlay(raster_paths, gdf: gpd.GeoDataFrame, title: str) -> None:
+    """Plot raster with label overlays for debugging.
+
+    raster_paths may be a single raster path, or a list of raster paths — in
+    the latter case all tiles are merged into a single mosaic and plotted
+    together on one figure (instead of one figure per tile).
+    """
+    if isinstance(raster_paths, (str, Path)):
+        raster_paths = [raster_paths]
+
+    if len(raster_paths) == 1:
+        with rasterio.open(raster_paths[0]) as ds:
+            img = ds.read([1, 2, 3])
+            transform = ds.transform
+            raster_crs = ds.crs
+            raster_bounds = ds.bounds
+            raster_res = ds.res
+        raster_label = Path(raster_paths[0]).name
+    else:
+        srcs = [rasterio.open(p) for p in raster_paths]
+        try:
+            img, transform = rio_merge(srcs, indexes=[1, 2, 3])
+            raster_crs = srcs[0].crs
+            raster_res = srcs[0].res
+        finally:
+            for s in srcs:
+                s.close()
+        height, width = img.shape[1], img.shape[2]
+        raster_bounds = BoundingBox(*rasterio.transform.array_bounds(height, width, transform))
+        raster_label = f"mosaic of {len(raster_paths)} tiles"
 
     # Diagnostic output
-    print(f"\n[plot] Raster: {Path(raster_path).name}")
+    print(f"\n[plot] Raster: {raster_label}")
     print(f"[plot]   CRS: {raster_crs}")
     print(f"[plot]   Bounds: {raster_bounds}")
     print(f"[plot]   Resolution: {raster_res}")
@@ -325,8 +348,9 @@ def prepare_multicounty_training(
         Show raster/label overlay plots for each county
     debug_plot_mode : str
         Only used when debug_plots is True. Controls how many tiles are plotted per county:
-        - "sample" (default): plot a single representative tile per county (current behavior)
-        - "all": plot every canonical tile for the county, one plot each
+        - "sample" (default): plot a single representative tile per county
+        - "all": merge every canonical tile for the county into one mosaic and
+          plot it as a single figure (with all labels overlaid)
     single_class : bool
         If True, filter labels for single-class training (requires focus_class)
     focus_class : str
@@ -458,8 +482,7 @@ def prepare_multicounty_training(
 
         if debug_plots:
             if debug_plot_mode == "all":
-                for tile in tiles:
-                    _plot_overlay(tile, gdf, title=f"{c} label alignment - {tile.name}")
+                _plot_overlay(tiles, gdf, title=f"{c} label alignment - all {len(tiles)} tiles")
             else:
                 _plot_overlay(tiles[0], gdf, title=f"{c} label alignment")
 
