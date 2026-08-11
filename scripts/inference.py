@@ -4,6 +4,7 @@ import os
 import json
 import argparse
 import time
+import warnings
 from datetime import timedelta
 import sys
 import glob
@@ -495,7 +496,13 @@ def main():
     if args.task == 'instance_seg' and boxes.numel() > 0 and len(kept_masks_flat) > 0:
         for m_u8, tform, s, l in zip(kept_masks_flat, kept_tile_transforms, scores.tolist(), labels.tolist()):
             m_np = m_u8.numpy().astype('uint8')
-            for geom, val in rio_features.shapes(m_np, transform=tform):
+            # rasterio's shapes() uses GDAL's deprecated 'Memory' driver internally (GDAL >= 3.11
+            # warns "'Memory' driver is deprecated ... Use 'MEM' onwards"); this is a cosmetic
+            # upstream warning with no effect on correctness, silenced here to avoid log noise.
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*'Memory' driver is deprecated.*")
+                shapes = list(rio_features.shapes(m_np, transform=tform))
+            for geom, val in shapes:
                 if int(val) == 0:
                     continue
                 from shapely.geometry import shape as shapely_shape
