@@ -362,7 +362,11 @@ def prepare_multicounty_training(
     out_vrt : str
         Output VRT path
     verified_only : bool
-        Keep only VerifiedTr == 1 if the column exists
+        Keep only rows where VerifiedTr is 0 or 1 if the column exists (i.e. drop rows
+        with any other/missing VerifiedTr value). VerifiedTr==0 rows are NOT dropped
+        outright: in single_class mode they feed the in-class-negative pool (see
+        _filter_singleclass_labels); in multi-class mode they are relabeled to an
+        explicit "Background" class (see below).
     debug_plots : bool
         Show raster/label overlay plots for each county
     debug_plot_mode : str
@@ -563,6 +567,21 @@ def prepare_multicounty_training(
         )
         
         _log("Single-class filtering complete. Final class distribution:")
+        print(merged["Classname"].value_counts())
+    else:
+        # Multi-class mode: unconfirmed (VerifiedTr=0) rows were kept above (across ALL
+        # classes, not just a single focus class) with their original Classname intact,
+        # since the earlier verified_only filter deliberately keeps both VerifiedTr 0/1
+        # rows. Relabel those unconfirmed rows to an explicit "Background" class here so
+        # they're trained as real (correctly-boxed) hard-negative/distractor examples
+        # rather than silently leaking in as if they were confirmed instances of their
+        # original class.
+        if "VerifiedTr" in merged.columns:
+            n_relabeled = int((merged["VerifiedTr"] == 0).sum())
+            merged.loc[merged["VerifiedTr"] == 0, "Classname"] = "Background"
+            _log(f"Multi-class mode: relabeled {n_relabeled} unconfirmed (VerifiedTr=0) rows to 'Background'")
+
+        _log("Multi-class mode. Final class distribution:")
         print(merged["Classname"].value_counts())
 
     # -------------------------------------------------------------------------
