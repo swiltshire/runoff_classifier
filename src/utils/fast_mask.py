@@ -12,7 +12,6 @@ import rasterio
 from rasterio import features as rio_features
 from rasterio.features import rasterize
 from rasterio.windows import Window
-from shapely.geometry import box
 
 
 def clear_mask_cache(raster_path: str, cache_dir: str, downsample: int = 16):
@@ -241,91 +240,66 @@ def filter_windows_by_mask_raster(
     return kept
 
 
-def load_aoi_gdf(mask_path: str, raster_crs) -> gpd.GeoDataFrame:
+def filter_boxes_by_mask_raster(
+    mask: np.ndarray,
+    boxes_xyxy: np.ndarray,
+    min_cover_frac: float = 0.0,
+    *,
+    row0: int,
+    col0: int,
+    downsample: int,
+) -> np.ndarray:
     """
-    Load AOI polygons once, reprojected to the raster's CRS, with an eagerly-built
-    spatial index for fast exact overlap tests (see aoi_cover_fraction()).
-    """
-    gdf = gpd.read_file(mask_path)
-    if gdf.crs != raster_crs:
-        gdf = gdf.to_crs(raster_crs)
-    gdf = gdf[gdf.geometry.notnull() & ~gdf.geometry.is_empty].reset_index(drop=True)
-    _ = gdf.sindex  # build spatial index eagerly
-    return gdf
+    Per-box AOI coverage test against a rasterized AOI mask, in full-resolution raster
+    pixel coordinates. Mirrors filter_windows_by_mask_raster()'s chip-slicing coverage-
+    fraction logic, but for many (xmin, ymin, xmax, ymax) detection boxes at once,
+    returning a boolean keep-mask instead of a filtered window list.
 
-
-def aoi_cover_fraction(geom, aoi_gdf: gpd.GeoDataFrame) -> float:
-    """
-    Exact AOI coverage fraction for a single geometry (e.g. a detection box or polygon),
-    computed via true geometric intersection rather than a downsampled raster mask lookup.
-
-    Unlike the rasterized-mask approach used by filter_windows_by_mask_raster() (fine for
-    large windows, but blind to objects smaller than one downsampled cell), this has no
-    minimum-object-size limitation: it gives a geometrically correct answer regardless of
-    how small `geom` is.
-
-    NOTE: for filtering many geometries at once (e.g. all detection boxes in a rank),
-    use aoi_cover_fractions_bulk() instead - calling this function in a Python loop over
-    thousands of boxes incurs per-call pandas/GEOS overhead that can turn into a
-    multi-minute (or longer) stall.
-    """
-    if geom is None or geom.is_empty or geom.area <= 0:
-        return 0.0
-    candidate_idx = list(aoi_gdf.sindex.query(geom, predicate="intersects"))
-    if not candidate_idx:
-        return 0.0
-    overlap = aoi_gdf.geometry.iloc[candidate_idx].intersection(geom).area.sum()
-    overlap = min(overlap, geom.area)  # guard against double-counting overlapping AOI polygons
-    return overlap / geom.area
-
-
-def aoi_cover_fractions_bulk(geoms, aoi_gdf: gpd.GeoDataFrame) -> np.ndarray:
-    """
-    Vectorized version of aoi_cover_fraction() for many geometries at once.
-
-    Calling aoi_cover_fraction() in a Python loop over thousands of detection boxes is
-    dominated by per-call Python/pandas overhead (a fresh sindex.query() call, a pandas
-    .iloc[] row selection, and a GeoSeries.intersection() call, each time), not by the
-    actual geometric work. This does the equivalent computation with a single bulk
-    spatial-index query plus shapely's vectorized (ufunc) area/intersection operations,
-    which run over numpy arrays of geometries in C rather than one call at a time.
+    At downsample=1 (the caller's default - see MASK_DOWNSAMPLE in inference.py) this is
+    an exact per-pixel test with no minimum-object-size blind spot: a box's pixel span is
+    divided by 1, so it never collapses to a zero-size chip regardless of how small the
+    box is. This is plain numpy array slicing (no shapely/geopandas per-call overhead),
+    so it stays fast over many thousands of boxes and its runtime is completely
+    insensitive to how geometrically complex the real AOI polygons are - unlike an exact
+    vector (shapely) overlap test.
 
     Parameters
     ----------
-    geoms : sequence of shapely geometries
-        e.g. one box per surviving detection, in the same CRS as aoi_gdf.
-    aoi_gdf : GeoDataFrame
-        AOI polygons as returned by load_aoi_gdf() (already has an eager sindex).
+    mask : np.ndarray
+        AOI mask raster (AOI bbox only), shape (H_ds, W_ds), from get_mask_clipped().
+    boxes_xyxy : np.ndarray
+        (N, 4) array of (xmin, ymin, xmax, ymax) in full-resolution raster pixel coords.
+    min_cover_frac : float
+        Minimum fraction [0..1] of mask coverage required to keep a box.
+    row0, col0 : int
+        Top-left pixel (full-resolution) of the AOI mask bounding box (from get_mask_clipped()).
+    downsample : int
+        Downsampling factor used to build `mask` (from get_mask_clipped()).
 
     Returns
     -------
-    np.ndarray of float64, shape (len(geoms),)
-        Coverage fraction [0..1] for each input geometry, in the same order.
+    np.ndarray of bool, shape (N,)
+        True for boxes that meet the mask coverage criterion.
     """
-    import shapely
-
-    n = len(geoms)
-    fracs = np.zeros(n, dtype=np.float64)
+    n = len(boxes_xyxy)
+    keep = np.zeros(n, dtype=bool)
     if n == 0:
-        return fracs
+        return keep
 
-    geoms_arr = np.asarray(geoms, dtype=object)
-    areas = shapely.area(geoms_arr)
-
-    # bulk sindex query: returns (input_idx, tree_idx) arrays of matching pairs in one call
-    input_idx, tree_idx = aoi_gdf.sindex.query(geoms_arr, predicate="intersects")
-    if len(input_idx) == 0:
-        return fracs
-
-    aoi_geoms = aoi_gdf.geometry.to_numpy()[tree_idx]
-    inter_areas = shapely.area(shapely.intersection(geoms_arr[input_idx], aoi_geoms))
-
-    # sum overlap area per input geometry (a geometry may match multiple AOI polygons)
-    overlap_sums = np.zeros(n, dtype=np.float64)
-    np.add.at(overlap_sums, input_idx, inter_areas)
-
-    valid = areas > 0
-    # guard against double-counting overlapping AOI polygons
-    fracs[valid] = np.minimum(overlap_sums[valid], areas[valid]) / areas[valid]
-    return fracs
+    Hm, Wm = mask.shape
+    for i in range(n):
+        xmin, ymin, xmax, ymax = boxes_xyxy[i]
+        c0 = max(0, min(Wm, (int(xmin) - col0) // downsample))
+        c1 = max(0, min(Wm, (int(xmax) - col0) // downsample))
+        r0 = max(0, min(Hm, (int(ymin) - row0) // downsample))
+        r1 = max(0, min(Hm, (int(ymax) - row0) // downsample))
+        if r1 <= r0 or c1 <= c0:
+            continue
+        chip = mask[r0:r1, c0:c1]
+        if chip.size == 0:
+            continue
+        cover = float(chip.sum()) / float(chip.size)
+        if cover > 0.0 and cover >= min_cover_frac:
+            keep[i] = True
+    return keep
 

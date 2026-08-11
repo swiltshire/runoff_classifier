@@ -35,9 +35,8 @@ from src.utils.tiling import make_grid_windows, adjust_boxes_to_global
 from src.utils.fast_mask import (
     get_mask_clipped,
     filter_windows_by_mask_raster,
+    filter_boxes_by_mask_raster,
     clear_mask_cache,
-    load_aoi_gdf,
-    aoi_cover_fractions_bulk,
 )
 from src.utils.make_vrt import write_mosaic_vrt
 
@@ -45,7 +44,12 @@ from src.utils.make_vrt import write_mosaic_vrt
 # configuration
 # ---------------------------
 
-MASK_DOWNSAMPLE = 16  # downsample AOI mask for faster loading
+# Single AOI mask, used for both window-level pre-filtering and per-box filtering.
+# Must stay at 1 (no downsampling): box-level filtering needs exact pixel coverage so
+# small detections (e.g. Tile_Outlet, often <16px) never collapse to a zero-size chip
+# and get spuriously rejected. Window-level filtering cost is bounded by window pixel
+# count (not mask size), so full resolution here is not a meaningful perf cost.
+MASK_DOWNSAMPLE = 1
 
 # ----------------------------
 # helpers: logging + normalizer
@@ -110,6 +114,12 @@ def build_normalizer(norm_type: str):
 # -------------------------
 
 def resolve_raster_input(path_or_dir):
+    # NOTE: only (re)write the VRT and clear its cached AOI mask when the VRT doesn't
+    # already exist. Previously this ran unconditionally on every invocation (this
+    # function is called at the start of every inference run), which cleared the
+    # persistent per-county mask cache on every single run and defeated the whole
+    # point of caching it. The VRT is deterministic for a given tif set, so if it's
+    # already on disk there's nothing to regenerate and no reason to invalidate the mask.
     if os.path.isdir(path_or_dir):
         files = sorted(glob.glob(os.path.join(path_or_dir, "*.tif")))
         if not files:
@@ -117,8 +127,9 @@ def resolve_raster_input(path_or_dir):
         parent = os.path.dirname(os.path.abspath(path_or_dir))
         parent_name = os.path.basename(parent)
         out_vrt = os.path.join(parent, f"{parent_name}_mosaic.vrt")
-        write_mosaic_vrt(out_vrt, files)
-        clear_mask_cache(out_vrt, os.path.dirname(out_vrt))
+        if not os.path.exists(out_vrt):
+            write_mosaic_vrt(out_vrt, files)
+            clear_mask_cache(out_vrt, os.path.dirname(out_vrt), downsample=MASK_DOWNSAMPLE)
         return out_vrt
 
     if any(ch in path_or_dir for ch in ["*", "?", "["]):
@@ -129,8 +140,9 @@ def resolve_raster_input(path_or_dir):
         parent = os.path.dirname(tile_dir)
         parent_name = os.path.basename(parent)
         out_vrt = os.path.join(parent, f"{parent_name}_mosaic.vrt")
-        write_mosaic_vrt(out_vrt, files)
-        clear_mask_cache(out_vrt, os.path.dirname(out_vrt))
+        if not os.path.exists(out_vrt):
+            write_mosaic_vrt(out_vrt, files)
+            clear_mask_cache(out_vrt, os.path.dirname(out_vrt), downsample=MASK_DOWNSAMPLE)
         return out_vrt
 
     return path_or_dir
@@ -263,7 +275,6 @@ def main():
     # -----------------------------
     mask_raster = None
     mask_meta = None
-    aoi_gdf = None
 
     if args.mask_path:
         if is_main_process():
@@ -305,13 +316,6 @@ def main():
                 len(windows_all),
                 total_before,
             )
-
-        # Load AOI polygons once per rank for exact (non-rasterized) per-detection
-        # overlap tests later (see aoi_cover_fraction()) — avoids the small-object
-        # blind spot inherent to a downsampled raster mask lookup.
-        with rasterio.open(args.raster_path) as src:
-            raster_crs = src.crs
-        aoi_gdf = load_aoi_gdf(args.mask_path, raster_crs)
 
     if is_main_process():
         logger.info(
@@ -444,30 +448,30 @@ def main():
         kept_masks_flat = []
         kept_tile_transforms = []
 
-    # exact (non-rasterized) AOI enforcement (pre-vectorization) to drop out-of-AOI detections.
-    # Uses true geometric overlap against the AOI polygons instead of a downsampled raster-mask
-    # lookup, so small objects (e.g. Tile_Outlet, often <16px) are never spuriously rejected due
-    # to collapsing to a zero-size span in a coarse mask grid.
-    if args.mask_path and len(boxes) > 0 and aoi_gdf is not None:
-        with rasterio.open(args.raster_path) as src:
-            box_transform = src.transform
+    # AOI enforcement (post per-rank-NMS) via the same raster mask used for window-level
+    # pre-filtering above. Boxes are already in full-resolution raster pixel coords, so
+    # this is a direct array lookup (no world-coordinate transform, no shapely) - fast and
+    # exact at MASK_DOWNSAMPLE=1, since dividing a box's pixel span by 1 never collapses
+    # it to a zero-size chip regardless of how small the box is.
+    if args.mask_path and len(boxes) > 0 and mask_raster is not None:
         min_frac = max(0.0, float(args.min_cover_frac))
-
-        box_geoms = []
-        for b in boxes.tolist():
-            xmin, ymin, xmax, ymax = b
-            x0, y0 = box_transform * (xmin, ymin)
-            x1, y1 = box_transform * (xmax, ymax)
-            box_geoms.append(shapely_box(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)))
+        boxes_np = boxes.numpy()
 
         if is_main_process():
-            logger.info("[debug] computing exact AOI overlap for %d boxes (vectorized)", len(box_geoms))
+            logger.info("[debug] filtering %d boxes by AOI mask", len(boxes_np))
 
-        fracs = aoi_cover_fractions_bulk(box_geoms, aoi_gdf)
-        keep_box = [idx for idx, frac in enumerate(fracs) if frac > 0.0 and frac >= min_frac]
+        keep_mask = filter_boxes_by_mask_raster(
+            mask_raster,
+            boxes_np,
+            min_cover_frac=min_frac,
+            row0=mask_meta["row0"],
+            col0=mask_meta["col0"],
+            downsample=mask_meta["downsample"],
+        )
+        keep_box = np.nonzero(keep_mask)[0].tolist()
 
         if is_main_process():
-            logger.info("[debug] AOI box filter kept %d of %d", len(keep_box), len(box_geoms))
+            logger.info("[debug] AOI box filter kept %d of %d", len(keep_box), len(boxes_np))
 
         if keep_box:
             keep_t = torch.tensor(keep_box, dtype=torch.long)
@@ -545,8 +549,8 @@ def main():
             merged = gpd.GeoDataFrame({"classname": [], "score": []}, geometry=[], crs=crs)
 
 
-        # AOI enforcement already happened exactly (via aoi_cover_fraction()) at the
-        # pre-vectorization, per-rank box-filtering step above, so each rank's partial
+        # AOI enforcement already happened exactly (via filter_boxes_by_mask_raster()) at
+        # the pre-vectorization, per-rank box-filtering step above, so each rank's partial
         # file is already AOI-filtered — no need to re-filter merged results here with
         # the coarse raster mask.
 
