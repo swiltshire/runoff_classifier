@@ -2,6 +2,7 @@
 
 import os
 import re
+import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
@@ -70,6 +71,15 @@ def ensure_dir(p: Path):
 def safe_name(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._ -]+", "_", s)
 
+def normalize_county_key(name: str) -> str:
+    """Canonical lookup key for a county name, robust to spacing/casing
+    differences (e.g. "La Porte", "LaPorte", "LAPORTE" all normalize to the
+    same key). Use this at every point where a county name from one source
+    (CSV, notebook widget, folder name) is compared against another, instead
+    of exact string equality.
+    """
+    return re.sub(r"\s+", "", name).strip().lower()
+
 def head_length(session: requests.Session, url: str) -> Optional[int]:
     try:
         r = session.head(url, timeout=30)
@@ -112,40 +122,6 @@ def has_raster_data(path: Path) -> bool:
             arr = ds.read(1, window=((0, min(256, ds.height)), (0, min(256, ds.width))))
             return arr.max() != arr.min()
     except Exception:
-        return False
-
-
-# ---------------- defensive validation ----------------
-
-def is_valid_tiff_header(path: Path) -> bool:
-    """Check if file has valid TIFF header."""
-    try:
-        with open(path, "rb") as f:
-            sig = f.read(4)
-        return sig in (b"II*\x00", b"MM\x00*")
-    except:
-        return False
-
-
-def matches_remote_size(path: Path, remote_size: Optional[int]) -> bool:
-    """Verify local file matches remote size."""
-    if remote_size is None:
-        return True  # can't verify
-    try:
-        return path.stat().st_size == remote_size
-    except:
-        return False
-
-
-def has_raster_data(path: Path) -> bool:
-    """Ensure file contains actual raster data (not empty/corrupted)."""
-    try:
-        import rasterio
-        with rasterio.open(path) as ds:
-            # read small window for speed
-            arr = ds.read(1, window=((0, min(256, ds.height)), (0, min(256, ds.width))))
-            return arr.max() != arr.min()
-    except:
         return False
 
 
@@ -218,7 +194,6 @@ def get_remote_crs(url: str) -> str:
     Retries up to 2 times with backoff to distinguish network hiccups
     (which succeed on retry) from actual data corruption (consistent failures).
     """
-    import time
     max_retries = 2
     
     for attempt in range(max_retries + 1):
@@ -239,6 +214,43 @@ def get_remote_crs(url: str) -> str:
                 continue
             # After all retries exhausted, mark as UNKNOWN
             return "UNKNOWN"
+
+
+def census_crs_distribution(
+    urls: List[str],
+    max_workers: int = 48,
+    show_progress: bool = True,
+    desc: str = "CRS census",
+) -> Dict[str, int]:
+    """Query the remote CRS of every url in `urls` in parallel and tally counts.
+
+    Shared by `survey_training_crs()` (full multi-county census used to pick
+    the pipeline's reference CRS) and `build_county_metadata_table()`
+    (per-county diagnostic census). I/O-bound (small header reads via
+    vsicurl), so a large thread pool is appropriate even on modest CPU counts.
+
+    Returns a dict of {crs_string: count}, e.g. {"EPSG:2968": 812, "EPSG:2967": 41}.
+    Tiles whose CRS could not be determined are tallied under "UNKNOWN".
+    """
+    crs_counts: Dict[str, int] = {}
+    if not urls:
+        return crs_counts
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(get_remote_crs, url): url for url in urls}
+
+        iterator = as_completed(futures)
+        if show_progress:
+            iterator = tqdm(iterator, total=len(urls), desc=desc, unit="tile")
+
+        for future in iterator:
+            try:
+                crs = future.result(timeout=60)
+            except Exception:
+                crs = "UNKNOWN"
+            crs_counts[crs] = crs_counts.get(crs, 0) + 1
+
+    return crs_counts
 
 
 def build_county_metadata_table(
@@ -290,9 +302,9 @@ def build_county_metadata_table(
             # Otherwise, auto-detect: find newest layer with 6-inch tiles
             layer_info = None
             
-            if imagery_years and county in imagery_years:
+            if imagery_years and normalize_county_key(county) in imagery_years:
                 # Strict mode: use specified year from CSV
-                specified_year = imagery_years[county]
+                specified_year = imagery_years[normalize_county_key(county)]
                 year_layer = year_to_layer_id(specified_year, session)
                 if not year_layer:
                     raise RuntimeError(f"CSV specifies year {specified_year} but Footprint_{specified_year} layer not found")
@@ -350,33 +362,16 @@ def build_county_metadata_table(
                     urls.append(attrs["url_tif"])
             
             # Query remote CRS for each tile (parallel - I/O bound)
-            crs_dict = {}
-            canonical_count = 0
-            
             pixel_size_str = sorted(pixel_sizes)[0] if pixel_sizes else "N/A"
-            
+
             print(f"  {county}: Found {len(urls)} 6-in tiles ({pixel_size_str}), querying CRS (parallel)...")
-            
-            # Use ThreadPoolExecutor for parallel CRS queries (I/O bound)
+
             # 48 workers for ml.g4dn.12xlarge (48 vCPUs, I/O-bound networking)
-            with ThreadPoolExecutor(max_workers=48) as executor:
-                futures = {executor.submit(get_remote_crs, url): url for url in urls}
-                
-                for future in tqdm(as_completed(futures), total=len(urls), desc=f"    {county} CRS", unit="tile", leave=False):
-                    try:
-                        crs = future.result(timeout=60)
-                        if crs not in crs_dict:
-                            crs_dict[crs] = 0
-                        crs_dict[crs] += 1
-                        
-                        if crs == CANONICAL_CRS:
-                            canonical_count += 1
-                    except Exception:
-                        # Track failures as UNKNOWN
-                        if "UNKNOWN" not in crs_dict:
-                            crs_dict["UNKNOWN"] = 0
-                        crs_dict["UNKNOWN"] += 1
-            
+            crs_dict = census_crs_distribution(
+                urls, max_workers=48, desc=f"    {county} CRS"
+            )
+            canonical_count = crs_dict.get(CANONICAL_CRS, 0)
+
             canonical_pct = (canonical_count / len(urls) * 100) if urls else 0.0
             
             if len(urls) > 0:
@@ -445,7 +440,11 @@ def load_training_imagery_years(csv_path: Path) -> Dict[str, int]:
         csv_path: Path to training_county_imagery_years.csv
         
     Returns:
-        Dict mapping county name -> 4-digit year (e.g., {"Bartholomew": 2021, "Benton": 2023})
+        Dict mapping normalize_county_key(county name) -> 4-digit year (e.g.,
+        {"bartholomew": 2021, "benton": 2023}). Keys are normalized via
+        `normalize_county_key()` (spaces stripped, lowercased) rather than the
+        raw CSV spelling, so callers must normalize their own county name the
+        same way before looking it up.
         
     Raises:
         FileNotFoundError: If CSV not found
@@ -463,7 +462,7 @@ def load_training_imagery_years(csv_path: Path) -> Dict[str, int]:
             raise ValueError(f"CSV must have exactly columns 'County' and 'Data Year', got: {reader.fieldnames}")
         
         for row in reader:
-            county_name = row["County"].strip().title()
+            county_key = normalize_county_key(row["County"])
             year_str = row["Data Year"].strip()
             
             # Convert 2-digit year to 4-digit
@@ -471,7 +470,7 @@ def load_training_imagery_years(csv_path: Path) -> Dict[str, int]:
             if year_int < 100:
                 year_int = 2000 + year_int
             
-            result[county_name] = year_int
+            result[county_key] = year_int
     
     return result
 
@@ -593,67 +592,141 @@ def survey_training_crs(
     session: requests.Session,
     imagery_years_csv: Path
 ) -> Tuple[str, Dict[str, int]]:
-    """Survey training counties to determine most common CRS.
-    
-    Samples one 6-inch tile from each training county and queries its remote CRS.
-    Returns the most common CRS and the full distribution.
-    
+    """Survey training counties to determine the most common CRS.
+
+    Queries the remote CRS of EVERY 6-inch tile across ALL training counties
+    (not just a single sample tile per county) and returns the CRS that is
+    most common by tile count. Full per-tile census is required because a
+    per-county-majority-vote can be skewed by counties with very different
+    tile counts, and some counties themselves span more than one native CRS.
+
+    The per-tile CRS lookups are I/O-bound (small remote header reads, no
+    downloads), so a single combined thread pool across every tile from every
+    county keeps this reasonably fast even for thousands of tiles.
+
     Args:
         counties: List of training county names
         session: requests session
         imagery_years_csv: Path to training_county_imagery_years.csv
-        
+
     Returns:
-        Tuple (reference_crs_string, {crs: count, ...}) - e.g., ("EPSG:2968", {"EPSG:2968": 18, "EPSG:2967": 4})
-        
+        Tuple (reference_crs_string, {crs: count, ...}) where counts are
+        TILE counts (not county counts), e.g.
+        ("EPSG:2968", {"EPSG:2968": 4821, "EPSG:2967": 312})
+
     Raises:
-        RuntimeError: If unable to determine CRS for training data
+        RuntimeError: If unable to determine CRS for any training tile
     """
     imagery_years = load_training_imagery_years(imagery_years_csv)
-    crs_counts = {}
-    
-    print(f"\n[CRS Survey] Sampling {len(counties)} training counties...")
-    
-    for county in tqdm(counties, desc="CRS survey", unit="county"):
-        if county not in imagery_years:
+
+    print(f"\n[CRS Survey] Gathering tile lists for {len(counties)} training counties...")
+
+    all_urls: List[str] = []
+    for county in tqdm(counties, desc="Fetching tile lists", unit="county"):
+        if normalize_county_key(county) not in imagery_years:
             print(f"  ⚠ {county}: Not in imagery_years CSV, skipping")
             continue
-        
+
         try:
-            year = imagery_years[county]
+            year = imagery_years[normalize_county_key(county)]
             layer_info = year_to_layer_id(year, session)
             if not layer_info:
                 print(f"  ⚠ {county} ({year}): Layer not found, skipping")
                 continue
-            
+
             layer_id, layer_name = layer_info
             layer_url = f"{SERVICE_URL}/{layer_id}"
-            
-            # Get sample tile
+
             attrs = fetch_attrs(session, layer_url, county_where(county))
             six_inch = [a for a in attrs if a.get("pixel_size") == "06 in." and a.get("url_tif")]
-            
+
             if not six_inch:
                 print(f"  ⚠ {county} ({year}): No 6-inch tiles found, skipping")
                 continue
-            
-            # Query CRS of first tile
-            sample_url = six_inch[0]["url_tif"]
-            crs = get_remote_crs(sample_url)
-            crs_counts[crs] = crs_counts.get(crs, 0) + 1
-            
+
+            all_urls.extend(a["url_tif"] for a in six_inch)
+
         except Exception as e:
             print(f"  ✗ {county}: {str(e)}")
-    
+
+    if not all_urls:
+        raise RuntimeError("Unable to determine CRS from any training county")
+
+    print(f"[CRS Survey] Querying CRS for all {len(all_urls)} tiles (parallel)...")
+    crs_counts = census_crs_distribution(all_urls, max_workers=48, desc="CRS survey")
+    crs_counts.pop("UNKNOWN", None)
+
     if not crs_counts:
         raise RuntimeError("Unable to determine CRS from any training county")
-    
-    # Find most common CRS
+
+    # Find most common CRS (by tile count)
     reference_crs = max(crs_counts, key=crs_counts.get)
     print(f"\n[CRS Survey] Selected reference CRS: {reference_crs}")
     print(f"[CRS Survey] Distribution: {', '.join(f'{crs}({cnt})' for crs, cnt in sorted(crs_counts.items(), key=lambda x: -x[1]))}\n")
     
     return reference_crs, crs_counts
+
+
+def quick_reference_crs_from_county(
+    county: str,
+    session: requests.Session,
+    imagery_years_csv: Optional[Path] = None,
+) -> str:
+    """Fast alternative to `survey_training_crs()`: determine the reference
+    CRS by reading a single representative tile from one county, instead of
+    censusing every tile across every training county (which can take hours
+    for large training sets).
+
+    Correctness note: with the mosaic-then-reproject architecture (see
+    `prepare_reprojected_tiles.py`), the reference CRS choice is a pure
+    efficiency/convenience decision, not a correctness one - EVERY native-CRS
+    group (including one that already matches the chosen reference CRS) is
+    warped through the same `gdalwarp -t_srs` pipeline, so picking a CRS
+    that isn't the true county-wide majority just means a few more tiles get
+    warped instead of passed through unchanged. Use this when you're willing
+    to assume one county (e.g. the original reference county) is
+    representative and want to skip the full census.
+
+    Args:
+        county: county name to sample (e.g. "Benton")
+        session: requests session
+        imagery_years_csv: optional path to training_county_imagery_years.csv;
+            if provided and `county` has an entry, uses that pinned year
+            (consistent with the rest of the pipeline); otherwise auto-detects
+            the newest/most-complete year for `county`.
+
+    Returns:
+        CRS string, e.g. "EPSG:2968"
+
+    Raises:
+        RuntimeError: if no 6-inch tile / CRS can be found for `county`
+    """
+    imagery_years: Dict[str, int] = {}
+    if imagery_years_csv:
+        imagery_years_csv = Path(imagery_years_csv)
+        if imagery_years_csv.exists():
+            imagery_years = load_training_imagery_years(imagery_years_csv)
+
+    pinned_year = imagery_years.get(normalize_county_key(county))
+    if pinned_year is not None:
+        layer_info = year_to_layer_id(pinned_year, session)
+        if not layer_info:
+            raise RuntimeError(f"CSV specifies year {pinned_year} for {county} but Footprint_{pinned_year} layer not found")
+        layer_id, layer_name = layer_info
+        year = pinned_year
+    else:
+        year, _, layer_id, layer_name = find_complete_imagery_year(session, county)
+
+    layer_url = f"{SERVICE_URL}/{layer_id}"
+    attrs = fetch_attrs(session, layer_url, county_where(county))
+    six_inch = [a for a in attrs if a.get("pixel_size") == "06 in." and a.get("url_tif")]
+    if not six_inch:
+        raise RuntimeError(f"No 6-inch tiles found for {county} in year {year}")
+
+    sample_url = six_inch[0]["url_tif"]
+    crs = get_remote_crs(sample_url)
+    print(f"[Quick CRS] Sampled {county} ({year}, 1 of {len(six_inch)} tiles): {crs}")
+    return crs
 
 
 def fetch_all_indiana_counties(session: requests.Session) -> List[str]:

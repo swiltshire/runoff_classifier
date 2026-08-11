@@ -49,15 +49,22 @@ runoff_classifier/
 │       ├── make_vrt.py          # VRT mosaic builder
 │       ├── crs_utils.py         # CRS normalization helpers
 │       ├── fast_mask.py         # Mask-based filtering
-│       ├── prepare_reprojected_tiles.py    # S3 imagery prep
+│       ├── prepare_reprojected_tiles.py    # Canonical imagery mosaic/reproject pipeline
 │       └── indiana_cogs.py      # Indiana COG helpers
 ├── data/
-│   ├── counties/                # County-specific data (shapefiles + tiles)
+│   ├── counties/                # County-specific data
+│   │   └── {county}/
+│   │       ├── *.shp             # Training labels (shapefile)
+│   │       ├── tiles/            # Raw, pristine, native-CRS downloaded tiles
+│   │       └── canonical_tiles/  # Seamless canonical-CRS chips (generated; used for training/inference)
+│   ├── _canonical_chip_cache/   # Shared canonical chip cache, keyed by (epsg, row, col) (generated)
 │   ├── multi_county_labels.gpkg # Merged training labels (generated)
 │   └── multi_county_training_mosaic.vrt  # VRT mosaic (generated)
 └── outputs/
+    ├── _native_mosaic_cache/    # Per-CRS native + warped VRTs (generated, virtual/cheap)
     ├── train_multicounty/       # Training outputs (models, logs)
     ├── inferences_*/            # Per-county inference results
+    ├── .reference_crs           # Persisted canonical CRS for the pipeline (generated)
     └── classes.json             # Class names (auto-generated)
 ```
 
@@ -127,7 +134,8 @@ prepare_multicounty_training(
 ```
 
 **Inputs:**
-- County directories with structure: `{county}/tiles/*.tif` + `{county}/*.shp`
+- County directories with structure: `{county}/canonical_tiles/*.tif` + `{county}/*.shp`
+- `canonical_tiles/` is produced by `ensure_canonical_mosaic_for_counties()` (see [Imagery Reprojection Pipeline](#imagery-reprojection-pipeline) below) - it must be run for a county before that county can be used for training
 - Shapefiles may use 'Classname', 'classname', or 'Class' columns (auto-normalized)
 
 **Outputs:**
@@ -199,7 +207,7 @@ Inference can be run on one or more counties. The notebook provides:
 python -m torch.distributed.run --nproc_per_node=4 scripts/inference.py \
     --task instance_seg \
     --checkpoint "outputs/train_multicounty/model_final.pth" \
-    --raster_path "data/counties/Benton/tiles/" \
+    --raster_path "data/counties/Benton/canonical_tiles/" \
     --out_vector "outputs/inferences_Benton/detections.gpkg" \
     --tile_size 512 \
     --score_thresh 0.2 \
@@ -238,7 +246,11 @@ Look for per-county warnings like "⚠ County X: 95.0% Tile_Outlet" — indicate
 
 ### CRS Mismatch Errors
 
-Ensure all county shapefiles are reprojected to target CRS before training. The `prepare_multicounty_training()` function will error if CRS doesn't match tiles.
+`prepare_multicounty_training()` reads the pipeline's canonical CRS directly from `outputs/.reference_crs` (set by the CRS survey step) and reprojects each county's labels to it - it does not sample tiles to infer a target CRS. If you see CRS mismatch warnings, re-run the CRS survey cell in the notebook, or confirm `canonical_tiles/` exists (and was generated after the current `.reference_crs`) for every selected county.
+
+### Triangular NoData Slivers Between Tiles
+
+This was caused by the old per-tile-independent reprojection approach (each raw tile warped in isolation, with no neighboring-tile context for the resampler at its own edges). It is fixed by the mosaic-then-reproject architecture described in [Imagery Reprojection Pipeline](#imagery-reprojection-pipeline): every native-CRS group is mosaicked first, then warped once, so the resampler always has full context. If slivers reappear, it usually means a `canonical_tiles/` chip was generated from a warped VRT that was missing tiles later added by another county - use `force=True` (or wait for the automatic border-invalidation to trigger, which force-regenerates chips near newly added counties) when calling `ensure_canonical_mosaic_for_counties()`.
 
 ### GPU Out of Memory
 
@@ -253,7 +265,38 @@ Check CPU-to-GPU pipeline:
 
 ---
 
+## Imagery Reprojection Pipeline
+
+Raw county imagery is downloaded in whatever native CRS the source provider used (Indiana orthoimagery spans a handful of different state-plane zones/epochs). Training and inference both require seamless imagery in a single canonical CRS, so `src/utils/prepare_reprojected_tiles.py` implements a **mosaic-then-reproject** pipeline via `ensure_canonical_mosaic_for_counties(counties, force=False, max_workers=16)`:
+
+1. Raw tiles are downloaded per county to `data/counties/{county}/tiles/` and kept pristine (nothing overwrites them in place).
+2. All locally available raw tiles (across every county ever downloaded, not just the ones requested) are grouped by native EPSG code.
+3. Each native-CRS group is mosaicked with `gdalbuildvrt`, then warped **once** to the canonical CRS/resolution as a lazy VRT (`gdalwarp -of VRT`). Because the resampler sees the full mosaic, there's no tile-edge context starvation.
+4. A fixed-size, tap-aligned, globally origin-anchored "canonical chip" grid (independent of the original tile boundaries) is cropped out of the warped VRT with `gdal_translate -projwin` (pure extraction, no further resampling). Chips are cached in S3 and a local shared cache, keyed by `(epsg, row, col)` - the same physical chip is reused for training and inference regardless of which counties are requested.
+5. Each requested county gets a `data/counties/{county}/canonical_tiles/` folder, materialized as hardlinks (or copies) into the shared chip cache, filtered to that county's own extent.
+
+**Border invalidation:** when a genuinely new county is added whose raw tiles fall in a CRS group with existing cached chips, any chip within one chip-width of the new tiles' bounding box is force-regenerated from the now-larger mosaic, since it may have lacked that data as resampling context previously. This keeps incremental runs fast (only new/border-adjacent chips are recomputed) without leaving stale slivers at the seam between old and new counties.
+
+The reference/canonical CRS itself is chosen by surveying **every** 6-inch tile across **all** training counties (not a single sample per county) via `survey_training_crs()` in `indiana_cogs.py`, and persisted to `outputs/.reference_crs` so it survives kernel restarts and is reused by every downstream step (including inference on brand-new counties).
+
+---
+
 ## Recent Changes
+
+### AOI Mask Filtering Fix + Persistent Mask Caching
+- **Fixed:** A hardcoded `MASK_DOWNSAMPLE` constant in `scripts/inference.py` was lowering the resolution of the rasterized AOI (NHD waterway) mask used to filter detections. Any detection box smaller than the downsample factor in either pixel dimension was silently, permanently rejected regardless of true location — this was collapsing recall for small object classes (e.g. Tile_Outlet, median bbox diagonal ~12.5px). Fixed by using a single, full-resolution (`MASK_DOWNSAMPLE=1`) mask shared by both window-level and box-level filtering, with box-level coverage checked via a fast raster-array lookup (`filter_boxes_by_mask_raster()` in `src/utils/fast_mask.py`) instead of a downsampled mask.
+- **Fixed:** Persistent per-county AOI mask caching was silently defeated — `resolve_raster_input()` cleared the cached mask on every single inference run (it rebuilt the mosaic VRT unconditionally, which always triggered a cache-clear). It now only rebuilds the VRT/clears the cache when the VRT doesn't already exist, so the mask is actually built once and reused across runs as intended.
+
+### Training Imagery Year Pinning + County-Name Matching Fix
+- **Fixed:** `ensure_canonical_mosaic_for_counties()` never passed `imagery_year` to `download_6in_tiles()`, so it always auto-detected the newest/most-complete imagery year — silently ignoring `data/training_county_imagery_years.csv` (the year each county's training labels were actually verified against). It now pins each county's download to its CSV year when available, and logs an explicit `WARNING: no pinned imagery year for {county}` if a requested county has no CSV entry (rather than silently auto-detecting).
+- **Fixed:** County-name matching bug — `load_training_imagery_years()` normalized keys via `.strip().title()`, which collapses any unbroken letter-run (e.g. `"LaPorte"`) to `"Laporte"`, never matching the literal county names used elsewhere (notebook lists, folder names). This caused La Porte to silently fall through to auto-detect in `survey_training_crs()`/`build_county_metadata_table()`. Added `normalize_county_key()` (strip whitespace, lowercase) in `indiana_cogs.py`, applied consistently everywhere a county name is looked up against the CSV.
+
+### Mosaic-Then-Reproject Imagery Pipeline
+- **Fixed:** Triangular NoData slivers at tile boundaries in reprojected imagery, caused by independent per-tile `gdalwarp` reprojection lacking neighbor-tile context.
+- **Replaced:** `ensure_canonical_tiles_for_counties()` (per-tile reprojection, overwrote raw tiles in place) with `ensure_canonical_mosaic_for_counties()` (mosaic native-CRS groups first, warp once, crop a shared deterministic chip grid).
+- **Added:** Per-county `canonical_tiles/` folders (used by both training and inference) backed by a shared, deduplicated S3 + local chip cache.
+- **Improved:** `survey_training_crs()` now censuses every tile across all training counties (previously sampled one tile per county), matching the thoroughness already used by `build_county_metadata_table()`.
+- **Cleanup:** Removed duplicate function definitions in `indiana_cogs.py` (`is_valid_tiff_header`, `matches_remote_size`, `has_raster_data` were each defined twice).
 
 ### Data Validation Consolidation
 - **Removed:** `validate_multicounty.py`, `debug_multicounty.py`, `analyze_training_data.py`
@@ -274,10 +317,12 @@ Check CPU-to-GPU pipeline:
 
 ### Adding New Counties
 
-1. Ensure county data structure: `data/counties/{county}/tiles/*.tif` + `{county}/*.shp`
-2. Add to selected counties in notebook
-3. Run `prepare_multicounty_training()` with new county included
-4. Validate before training
+1. Ensure county has a shapefile at `data/counties/{county}/*.shp`
+2. If the county's labels were verified against a specific imagery year, add a row to `data/training_county_imagery_years.csv` (`County,Data Year`) so `ensure_canonical_mosaic_for_counties()` downloads that exact year instead of auto-detecting the newest available one. Without a CSV entry, it auto-detects and logs a `WARNING: no pinned imagery year for {county}` line.
+3. Run `ensure_canonical_mosaic_for_counties(counties=[county, ...])` (in the notebook's fetch step) to download raw tiles and produce `data/counties/{county}/canonical_tiles/`
+4. Add to selected counties in notebook
+5. Run `prepare_multicounty_training()` with new county included
+6. Validate before training
 
 ### Modifying Model Architecture
 

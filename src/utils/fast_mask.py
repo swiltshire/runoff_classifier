@@ -12,7 +12,6 @@ import rasterio
 from rasterio import features as rio_features
 from rasterio.features import rasterize
 from rasterio.windows import Window
-from shapely.geometry import box
 
 
 def clear_mask_cache(raster_path: str, cache_dir: str, downsample: int = 16):
@@ -239,4 +238,68 @@ def filter_windows_by_mask_raster(
             kept.append(w)
 
     return kept
+
+
+def filter_boxes_by_mask_raster(
+    mask: np.ndarray,
+    boxes_xyxy: np.ndarray,
+    min_cover_frac: float = 0.0,
+    *,
+    row0: int,
+    col0: int,
+    downsample: int,
+) -> np.ndarray:
+    """
+    Per-box AOI coverage test against a rasterized AOI mask, in full-resolution raster
+    pixel coordinates. Mirrors filter_windows_by_mask_raster()'s chip-slicing coverage-
+    fraction logic, but for many (xmin, ymin, xmax, ymax) detection boxes at once,
+    returning a boolean keep-mask instead of a filtered window list.
+
+    At downsample=1 (the caller's default - see MASK_DOWNSAMPLE in inference.py) this is
+    an exact per-pixel test with no minimum-object-size blind spot: a box's pixel span is
+    divided by 1, so it never collapses to a zero-size chip regardless of how small the
+    box is. This is plain numpy array slicing (no shapely/geopandas per-call overhead),
+    so it stays fast over many thousands of boxes and its runtime is completely
+    insensitive to how geometrically complex the real AOI polygons are - unlike an exact
+    vector (shapely) overlap test.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        AOI mask raster (AOI bbox only), shape (H_ds, W_ds), from get_mask_clipped().
+    boxes_xyxy : np.ndarray
+        (N, 4) array of (xmin, ymin, xmax, ymax) in full-resolution raster pixel coords.
+    min_cover_frac : float
+        Minimum fraction [0..1] of mask coverage required to keep a box.
+    row0, col0 : int
+        Top-left pixel (full-resolution) of the AOI mask bounding box (from get_mask_clipped()).
+    downsample : int
+        Downsampling factor used to build `mask` (from get_mask_clipped()).
+
+    Returns
+    -------
+    np.ndarray of bool, shape (N,)
+        True for boxes that meet the mask coverage criterion.
+    """
+    n = len(boxes_xyxy)
+    keep = np.zeros(n, dtype=bool)
+    if n == 0:
+        return keep
+
+    Hm, Wm = mask.shape
+    for i in range(n):
+        xmin, ymin, xmax, ymax = boxes_xyxy[i]
+        c0 = max(0, min(Wm, (int(xmin) - col0) // downsample))
+        c1 = max(0, min(Wm, (int(xmax) - col0) // downsample))
+        r0 = max(0, min(Hm, (int(ymin) - row0) // downsample))
+        r1 = max(0, min(Hm, (int(ymax) - row0) // downsample))
+        if r1 <= r0 or c1 <= c0:
+            continue
+        chip = mask[r0:r1, c0:c1]
+        if chip.size == 0:
+            continue
+        cover = float(chip.sum()) / float(chip.size)
+        if cover > 0.0 and cover >= min_cover_frac:
+            keep[i] = True
+    return keep
 

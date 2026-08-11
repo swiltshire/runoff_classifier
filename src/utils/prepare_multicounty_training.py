@@ -11,11 +11,13 @@ import pandas as pd
 import numpy as np
 import rasterio
 from rasterio.plot import show
+from rasterio.merge import merge as rio_merge
 from rasterio.coords import BoundingBox
 from shapely.geometry import box
 import matplotlib.pyplot as plt
 
 from utils.make_vrt import write_mosaic_vrt
+from utils.indiana_cogs import project_root, CANONICAL_CRS as DEFAULT_CANONICAL_CRS
 
 
 # -----------------------------------------------------------------------------
@@ -68,17 +70,39 @@ def _bounds_intersect(a: BoundingBox, b: BoundingBox) -> bool:
     return box(*a).intersects(box(*b))
 
 
-def _plot_overlay(raster_path: str, gdf: gpd.GeoDataFrame, title: str) -> None:
-    """Plot raster with label overlays for debugging."""
-    with rasterio.open(raster_path) as ds:
-        img = ds.read([1, 2, 3])
-        transform = ds.transform
-        raster_crs = ds.crs
-        raster_bounds = ds.bounds
-        raster_res = ds.res
+def _plot_overlay(raster_paths, gdf: gpd.GeoDataFrame, title: str) -> None:
+    """Plot raster with label overlays for debugging.
+
+    raster_paths may be a single raster path, or a list of raster paths — in
+    the latter case all tiles are merged into a single mosaic and plotted
+    together on one figure (instead of one figure per tile).
+    """
+    if isinstance(raster_paths, (str, Path)):
+        raster_paths = [raster_paths]
+
+    if len(raster_paths) == 1:
+        with rasterio.open(raster_paths[0]) as ds:
+            img = ds.read([1, 2, 3])
+            transform = ds.transform
+            raster_crs = ds.crs
+            raster_bounds = ds.bounds
+            raster_res = ds.res
+        raster_label = Path(raster_paths[0]).name
+    else:
+        srcs = [rasterio.open(p) for p in raster_paths]
+        try:
+            img, transform = rio_merge(srcs, indexes=[1, 2, 3])
+            raster_crs = srcs[0].crs
+            raster_res = srcs[0].res
+        finally:
+            for s in srcs:
+                s.close()
+        height, width = img.shape[1], img.shape[2]
+        raster_bounds = BoundingBox(*rasterio.transform.array_bounds(height, width, transform))
+        raster_label = f"mosaic of {len(raster_paths)} tiles"
 
     # Diagnostic output
-    print(f"\n[plot] Raster: {Path(raster_path).name}")
+    print(f"\n[plot] Raster: {raster_label}")
     print(f"[plot]   CRS: {raster_crs}")
     print(f"[plot]   Bounds: {raster_bounds}")
     print(f"[plot]   Resolution: {raster_res}")
@@ -122,6 +146,184 @@ def _plot_overlay(raster_path: str, gdf: gpd.GeoDataFrame, title: str) -> None:
     print(f"[plot] Plot complete.\n")
 
 
+def _filter_singleclass_labels(
+    gdf: gpd.GeoDataFrame,
+    focus_class: str,
+    positive_ratio: int = 80,
+    in_class_ratio: int = 50,
+    remove_overlaps: bool = True,
+    include_background: bool = True,
+) -> gpd.GeoDataFrame:
+    """
+    Filter merged labels for single-class training with tunable positive/negative ratio.
+    
+    Strategy:
+    - Confirmed positives: focus_class with VerifiedTr == 1 (e.g., confirmed Tile_Outlets)
+    - In-class negatives: focus_class with VerifiedTr == 0 (looked like focus_class but aren't)
+    - Out-of-class negatives: features from other classes (fundamentally different)
+    - Background pool splits between in-class and out-of-class using in_class_ratio
+    
+    Parameters
+    ----------
+    gdf : GeoDataFrame
+        Merged labels with 'Classname' and 'VerifiedTr' columns
+    focus_class : str
+        Target class name (e.g., 'Tile_Outlet')
+    positive_ratio : int
+        Percentage of training data that should be confirmed positives. Default 80.
+        Ignored when include_background=False.
+        - 80: 80% confirmed focus_class, 20% negatives (in-class + out-of-class combined)
+        - 50: 50/50 split between confirmed and negatives
+        - 20: 20% confirmed, 80% negatives
+    in_class_ratio : int
+        Percentage of the negative pool that should be in-class negatives. Default 50.
+        Ignored when include_background=False.
+        - 50: 50/50 split between in-class and out-of-class negatives
+        - 80: 80% in-class (misclassified examples), 20% out-of-class
+        - 20: 20% in-class, 80% out-of-class
+    remove_overlaps : bool
+        If True, remove any non-focus-class features that overlap with focus_class features.
+        This prevents conflicting training signals in overlap zones. Default True.
+        Ignored when include_background=False (there's no negative pool to filter).
+    include_background : bool
+        If True (default), builds a negative/"Background" pool sized via positive_ratio/
+        in_class_ratio, matching prior behavior. If False, returns ONLY confirmed
+        positives (VerifiedTr==1 focus_class rows) — no Background class, no negatives
+        at all. positive_ratio/in_class_ratio/remove_overlaps are ignored in this case.
+    
+    Returns
+    -------
+    GeoDataFrame
+        Filtered labels with only focus_class (and Background, unless
+        include_background=False)
+    """
+    
+    gdf = gdf.copy()
+    
+    # Ensure VerifiedTr column exists (some counties may not have it)
+    if "VerifiedTr" not in gdf.columns:
+        gdf["VerifiedTr"] = 1  # assume all verified if column missing
+    
+    # Validate focus_class exists
+    if focus_class not in gdf["Classname"].unique():
+        _fail(f"Focus class '{focus_class}' not found in labels. Available: {gdf['Classname'].unique()}")
+    
+    # Separate confirmed positives (focus_class with VerifiedTr == 1)
+    confirmed_positive = gdf[(gdf["Classname"] == focus_class) & (gdf["VerifiedTr"] == 1)].copy()
+
+    if not include_background:
+        # Positives-only mode: no negative/Background sampling at all.
+        confirmed_positive["Classname"] = focus_class
+        result = gpd.GeoDataFrame(confirmed_positive, geometry="geometry", crs=gdf.crs)
+        _log(f"  include_background=False: {len(result)} confirmed {focus_class} only "
+             f"(no negatives/Background class)")
+        return result
+
+    # In-class negatives: focus_class with VerifiedTr == 0 (misclassified examples)
+    in_class_negative = gdf[(gdf["Classname"] == focus_class) & (gdf["VerifiedTr"] == 0)].copy()
+    
+    # Out-of-class negatives: other classes
+    out_of_class_negative = gdf[(gdf["Classname"] != focus_class)].copy()
+    
+    _log(f"  Confirmed {focus_class} (VerifiedTr=1): {len(confirmed_positive)} examples")
+    _log(f"  In-class negatives ({focus_class}, VerifiedTr=0): {len(in_class_negative)} examples")
+    _log(f"  Out-of-class negatives (other classes): {len(out_of_class_negative)} examples")
+    
+    # Remove overlaps from out-of-class negatives
+    n_removed_overlaps = 0
+    if remove_overlaps and len(confirmed_positive) > 0:
+        # Union all confirmed positive geometries
+        focus_union = confirmed_positive.unary_union
+        
+        # Mark features that DO NOT overlap with focus
+        non_overlapping = ~out_of_class_negative.geometry.intersects(focus_union)
+        n_removed_overlaps = (~non_overlapping).sum()
+        
+        out_of_class_negative = out_of_class_negative[non_overlapping].copy()
+        
+        if n_removed_overlaps > 0:
+            _log(f"  Removed {n_removed_overlaps} out-of-class features overlapping confirmed {focus_class}")
+    
+    # Calculate target negative pool size based on positive_ratio
+    n_confirmed = len(confirmed_positive)
+    if positive_ratio <= 0 or positive_ratio >= 100:
+        _fail(f"positive_ratio must be between 1 and 99, got {positive_ratio}")
+    
+    # If confirmed are positive_ratio%, then negatives are (100-positive_ratio)%
+    # So: n_confirmed / total = positive_ratio / 100
+    # Therefore: total = n_confirmed * 100 / positive_ratio
+    # And: n_negatives = total - n_confirmed
+    n_total = int(n_confirmed * 100 / positive_ratio)
+    n_negatives_target = n_total - n_confirmed
+    
+    # Split negatives target between in-class and out-of-class
+    in_class_pct = in_class_ratio / 100.0
+    out_of_class_pct = (100 - in_class_ratio) / 100.0
+    
+    n_in_class_target = int(n_negatives_target * in_class_pct)
+    n_out_of_class_target = n_negatives_target - n_in_class_target
+    
+    # Sample with replacement if needed, reallocating shortfalls between pools
+    n_in_class_available = len(in_class_negative)
+    n_out_of_class_available = len(out_of_class_negative)
+    
+    if n_in_class_available == 0 and n_out_of_class_available == 0:
+        _fail(f"No negative examples available for {focus_class} training")
+    
+    # Try to get in_class_target, then reallocate any shortfall to out_of_class_target
+    n_in_class_actual = min(n_in_class_target, n_in_class_available)
+    n_in_class_shortfall = max(0, n_in_class_target - n_in_class_available)
+    n_out_of_class_adjusted = n_out_of_class_target + n_in_class_shortfall
+    
+    # Sample from each pool
+    if n_in_class_available > 0:
+        in_class_sample = in_class_negative.sample(
+            n=n_in_class_actual,
+            replace=(n_in_class_target > n_in_class_available),
+            random_state=42
+        )
+    else:
+        in_class_sample = gpd.GeoDataFrame(columns=in_class_negative.columns, crs=gdf.crs)
+    
+    if n_out_of_class_available > 0:
+        n_out_of_class_actual = min(n_out_of_class_adjusted, n_out_of_class_available)
+        out_of_class_sample = out_of_class_negative.sample(
+            n=n_out_of_class_actual,
+            replace=(n_out_of_class_adjusted > n_out_of_class_available),
+            random_state=42
+        )
+    else:
+        out_of_class_sample = gpd.GeoDataFrame(columns=out_of_class_negative.columns, crs=gdf.crs)
+    
+    # Combine negative samples
+    background = pd.concat([in_class_sample, out_of_class_sample], ignore_index=True)
+    
+    # Log actual composition (accounting for reallocations)
+    n_background_actual = len(background)
+    actual_in_class_pct = (len(in_class_sample) / n_background_actual * 100) if n_background_actual > 0 else 0
+    actual_out_of_class_pct = (len(out_of_class_sample) / n_background_actual * 100) if n_background_actual > 0 else 0
+    
+    _log(f"  Negative pool target: {n_negatives_target} total")
+    if n_in_class_shortfall > 0:
+        _log(f"    In-class negatives (VerifiedTr=0): {len(in_class_sample)} (requested {n_in_class_target}, only {n_in_class_available} available)")
+        _log(f"    Out-of-class negatives (other classes): {len(out_of_class_sample)} (reallocated {n_in_class_shortfall} from in-class shortfall)")
+    else:
+        _log(f"    In-class negatives (VerifiedTr=0): {len(in_class_sample)} ({actual_in_class_pct:.1f}%)")
+        _log(f"    Out-of-class negatives (other classes): {len(out_of_class_sample)} ({actual_out_of_class_pct:.1f}%)")
+    
+    # Assign classes
+    confirmed_positive["Classname"] = focus_class
+    background["Classname"] = "Background"
+    
+    # Combine and return
+    result = pd.concat([confirmed_positive, background], ignore_index=True)
+    result = gpd.GeoDataFrame(result, geometry="geometry", crs=gdf.crs)
+    
+    final_ratio = 100 * len(confirmed_positive) / len(result)
+    _log(f"  Final: {len(confirmed_positive)} {focus_class} ({final_ratio:.1f}%) + {len(background)} Background ({100-final_ratio:.1f}%) = {len(result)} total")
+    
+    return result
+
 
 # -----------------------------------------------------------------------------
 # Main entry point
@@ -135,12 +337,19 @@ def prepare_multicounty_training(
     *,
     verified_only: bool = True,
     debug_plots: bool = False,
+    debug_plot_mode: str = "sample",
+    single_class: bool = False,
+    focus_class: str = None,
+    positive_ratio: int = 80,
+    in_class_ratio: int = 50,
+    include_background: bool = True,
 ) -> None:
     """
     Prepare a multi-county training dataset:
       - merge shapefiles
       - validate alignment
       - build a training VRT
+      - optionally filter for single-class training with tunable positive/negative ratio
 
     Parameters
     ----------
@@ -156,6 +365,31 @@ def prepare_multicounty_training(
         Keep only VerifiedTr == 1 if the column exists
     debug_plots : bool
         Show raster/label overlay plots for each county
+    debug_plot_mode : str
+        Only used when debug_plots is True. Controls how many tiles are plotted per county:
+        - "sample" (default): plot a single representative tile per county
+        - "all": merge every canonical tile for the county into one mosaic and
+          plot it as a single figure (with all labels overlaid)
+    single_class : bool
+        If True, filter labels for single-class training (requires focus_class)
+    focus_class : str
+        Target class for single-class training (e.g., 'Tile_Outlet')
+    positive_ratio : int
+        For single-class mode: percentage of training data that should be confirmed positives.
+        - 80 (default): 80% confirmed focus_class, 20% negatives
+        - 50: 50/50 split
+        - 20: 20% confirmed, 80% negatives
+    in_class_ratio : int
+        For single-class mode: percentage of the negative pool that should be in-class negatives.
+        - 50 (default): 50/50 split between in-class and out-of-class
+        - 80: 80% in-class (misclassified), 20% out-of-class
+        - 20: 20% in-class, 80% out-of-class
+        Ignored when include_background=False.
+    include_background : bool
+        For single-class mode: if True (default), builds a negative/Background pool
+        sized via positive_ratio/in_class_ratio. If False, keeps ONLY confirmed
+        positives (VerifiedTr==1 focus_class) — no Background class, no negatives at
+        all. positive_ratio/in_class_ratio are ignored in this case.
     """
 
     county_data_dir = Path(county_data_dir)
@@ -164,6 +398,9 @@ def prepare_multicounty_training(
 
     if not selected_counties:
         _fail("No counties selected")
+
+    if debug_plot_mode not in ("sample", "all"):
+        _fail(f"debug_plot_mode must be 'sample' or 'all', got {debug_plot_mode!r}")
 
     _log(f"Preparing training data for {len(selected_counties)} counties")
 
@@ -183,45 +420,29 @@ def prepare_multicounty_training(
         if len(shp_files) > 1:
             _log(f"WARNING: multiple shapefiles in {cdir}, using {shp_files[0].name}")
 
-        tiles = sorted((cdir / "tiles").glob("*.tif"))
+        tiles = sorted((cdir / "canonical_tiles").glob("*.tif"))
         if not tiles:
-            _fail(f"No tiles found in {cdir}/tiles")
+            _fail(
+                f"No canonical tiles found in {cdir}/canonical_tiles. "
+                f"Run ensure_canonical_mosaic_for_counties() for this county first."
+            )
 
         county_to_shp[c] = shp_files[0]
         county_to_tiles[c] = tiles
 
     # -------------------------------------------------------------------------
-    # Establish target CRS from first tile
+    # Target CRS: the pipeline's canonical CRS (every canonical_tiles/ chip is
+    # already reprojected + resampled to this CRS by
+    # ensure_canonical_mosaic_for_counties(), so there is no need to sample or
+    # sanity-check individual tiles here).
     # -------------------------------------------------------------------------
 
-    first_tile = county_to_tiles[selected_counties[0]][0]
-    with rasterio.open(first_tile) as ds:
-        target_crs = ds.crs
-        ref_bounds = ds.bounds
-        ref_res = ds.res
+    target_crs = DEFAULT_CANONICAL_CRS
+    _crs_config_file = project_root() / "outputs" / ".reference_crs"
+    if _crs_config_file.exists():
+        target_crs = _crs_config_file.read_text().strip()
 
-    _log(f"Target CRS: {target_crs} (from first tile: {first_tile.name})")
-    _log(f"Reference resolution: {ref_res}")
-    
-    # Sanity check: all tiles should be in same CRS
-    crs_counts = {}
-    crs_by_county = {}
-    for c in selected_counties:
-        for t in county_to_tiles[c][:1]:  # check first tile of each county
-            with rasterio.open(t) as ds:
-                crs_str = str(ds.crs)
-                crs_counts[crs_str] = crs_counts.get(crs_str, 0) + 1
-                crs_by_county[c] = crs_str
-    
-    if len(crs_counts) > 1:
-        _log(f"WARNING: Tiles have mixed CRS!")
-        for crs_str, count in sorted(crs_counts.items()):
-            _log(f"  {crs_str}: {count} counties")
-        _log(f"Per-county CRS mapping:")
-        for c in sorted(crs_by_county.keys()):
-            _log(f"  {c}: {crs_by_county[c]}")
-    else:
-        _log(f"✓ All tiles in same CRS: {list(crs_counts.keys())[0]}")
+    _log(f"Target CRS: {target_crs} (pipeline canonical CRS)")
 
     # -------------------------------------------------------------------------
     # Load + validate labels per county
@@ -243,17 +464,20 @@ def prepare_multicounty_training(
         gdf = _normalize_class_column(gdf, county=c)
 
         # Handle verified labels: keep both positive and negative examples
+        # NOTE: Do NOT overwrite Classname for VerifiedTr=0. Keep original class labels so that
+        # single-class filtering can identify in-class negatives (e.g., Tile_Outlet with VerifiedTr=0)
         if verified_only and "VerifiedTr" in gdf.columns:
             # Keep rows where VerifiedTr is 0 (negative) or 1 (positive)
             gdf = gdf[gdf["VerifiedTr"].isin([0, 1])]
             
-            # Assign "Background" class to negative examples (VerifiedTr == 0)
-            gdf.loc[gdf["VerifiedTr"] == 0, "Classname"] = "Background"
-            
-            # Log class distribution for this county
+            # Log class distribution for this county (split by VerifiedTr)
             n_positives = (gdf["VerifiedTr"] == 1).sum()
             n_negatives = (gdf["VerifiedTr"] == 0).sum()
-            _log(f"  {c}: {n_positives} positive examples, {n_negatives} negative (Background) examples")
+            _log(f"  {c}: {n_positives} confirmed (VerifiedTr=1), {n_negatives} unconfirmed (VerifiedTr=0)")
+        elif verified_only:
+            # If no VerifiedTr column, assume all records are verified (VerifiedTr=1)
+            gdf["VerifiedTr"] = 1
+            _log(f"  {c}: no VerifiedTr column, assuming all {len(gdf)} examples are confirmed")
 
         if gdf.empty:
             _log(f"WARNING: {c} has zero usable labels")
@@ -282,7 +506,10 @@ def prepare_multicounty_training(
             _log(f"  Bounds after force convert: {gdf_bounds_after}")
 
         if debug_plots:
-            _plot_overlay(tiles[0], gdf, title=f"{c} label alignment")
+            if debug_plot_mode == "all":
+                _plot_overlay(tiles, gdf, title=f"{c} label alignment - all {len(tiles)} tiles")
+            else:
+                _plot_overlay(tiles[0], gdf, title=f"{c} label alignment")
 
         gdf["county"] = c
         gdfs.append(gdf)
@@ -306,7 +533,36 @@ def prepare_multicounty_training(
 
     # Sanity: class distribution
     if "Classname" in merged.columns:
-        _log("Class distribution:")
+        _log("Class distribution before filtering:")
+        print(merged["Classname"].value_counts())
+
+    # -------------------------------------------------------------------------
+    # Single-class filtering (optional)
+    # -------------------------------------------------------------------------
+    
+    if single_class:
+        if not focus_class:
+            _fail("single_class=True requires focus_class parameter")
+        
+        if include_background:
+            _log(f"\nFiltering for single-class training: focus_class='{focus_class}'")
+            _log(f"Target ratio: {positive_ratio}% confirmed {focus_class}, {100-positive_ratio}% negatives")
+            _log(f"Negative composition: {in_class_ratio}% in-class (VerifiedTr=0), {100-in_class_ratio}% out-of-class")
+            _log(f"Removing overlaps: any out-of-class features overlapping confirmed {focus_class} will be excluded")
+        else:
+            _log(f"\nFiltering for single-class training: focus_class='{focus_class}'")
+            _log(f"include_background=False: keeping ONLY confirmed {focus_class} (VerifiedTr=1), no Background class")
+        
+        merged = _filter_singleclass_labels(
+            merged,
+            focus_class=focus_class,
+            positive_ratio=positive_ratio,
+            in_class_ratio=in_class_ratio,
+            remove_overlaps=True,
+            include_background=include_background,
+        )
+        
+        _log("Single-class filtering complete. Final class distribution:")
         print(merged["Classname"].value_counts())
 
     # -------------------------------------------------------------------------

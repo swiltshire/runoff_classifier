@@ -4,6 +4,7 @@ import os
 import json
 import argparse
 import time
+import warnings
 from datetime import timedelta
 import sys
 import glob
@@ -32,14 +33,24 @@ if PROJECT_ROOT not in sys.path:
 
 from src.models.model import build_fasterrcnn_model, build_maskrcnn_model
 from src.utils.tiling import make_grid_windows, adjust_boxes_to_global
-from src.utils.fast_mask import get_mask_clipped, filter_windows_by_mask_raster, clear_mask_cache
+from src.utils.fast_mask import (
+    get_mask_clipped,
+    filter_windows_by_mask_raster,
+    filter_boxes_by_mask_raster,
+    clear_mask_cache,
+)
 from src.utils.make_vrt import write_mosaic_vrt
 
 # ---------------------------
 # configuration
 # ---------------------------
 
-MASK_DOWNSAMPLE = 16  # downsample AOI mask for faster loading
+# Single AOI mask, used for both window-level pre-filtering and per-box filtering.
+# Must stay at 1 (no downsampling): box-level filtering needs exact pixel coverage so
+# small detections (e.g. Tile_Outlet, often <16px) never collapse to a zero-size chip
+# and get spuriously rejected. Window-level filtering cost is bounded by window pixel
+# count (not mask size), so full resolution here is not a meaningful perf cost.
+MASK_DOWNSAMPLE = 1
 
 # ----------------------------
 # helpers: logging + normalizer
@@ -104,6 +115,12 @@ def build_normalizer(norm_type: str):
 # -------------------------
 
 def resolve_raster_input(path_or_dir):
+    # NOTE: only (re)write the VRT and clear its cached AOI mask when the VRT doesn't
+    # already exist. Previously this ran unconditionally on every invocation (this
+    # function is called at the start of every inference run), which cleared the
+    # persistent per-county mask cache on every single run and defeated the whole
+    # point of caching it. The VRT is deterministic for a given tif set, so if it's
+    # already on disk there's nothing to regenerate and no reason to invalidate the mask.
     if os.path.isdir(path_or_dir):
         files = sorted(glob.glob(os.path.join(path_or_dir, "*.tif")))
         if not files:
@@ -111,8 +128,9 @@ def resolve_raster_input(path_or_dir):
         parent = os.path.dirname(os.path.abspath(path_or_dir))
         parent_name = os.path.basename(parent)
         out_vrt = os.path.join(parent, f"{parent_name}_mosaic.vrt")
-        write_mosaic_vrt(out_vrt, files)
-        clear_mask_cache(out_vrt, os.path.dirname(out_vrt))
+        if not os.path.exists(out_vrt):
+            write_mosaic_vrt(out_vrt, files)
+            clear_mask_cache(out_vrt, os.path.dirname(out_vrt), downsample=MASK_DOWNSAMPLE)
         return out_vrt
 
     if any(ch in path_or_dir for ch in ["*", "?", "["]):
@@ -123,8 +141,9 @@ def resolve_raster_input(path_or_dir):
         parent = os.path.dirname(tile_dir)
         parent_name = os.path.basename(parent)
         out_vrt = os.path.join(parent, f"{parent_name}_mosaic.vrt")
-        write_mosaic_vrt(out_vrt, files)
-        clear_mask_cache(out_vrt, os.path.dirname(out_vrt))
+        if not os.path.exists(out_vrt):
+            write_mosaic_vrt(out_vrt, files)
+            clear_mask_cache(out_vrt, os.path.dirname(out_vrt), downsample=MASK_DOWNSAMPLE)
         return out_vrt
 
     return path_or_dir
@@ -430,50 +449,30 @@ def main():
         kept_masks_flat = []
         kept_tile_transforms = []
 
-    # fast box-level mask enforcement (pre-vectorization) to drop obviously out-of-AOI detections
+    # AOI enforcement (post per-rank-NMS) via the same raster mask used for window-level
+    # pre-filtering above. Boxes are already in full-resolution raster pixel coords, so
+    # this is a direct array lookup (no world-coordinate transform, no shapely) - fast and
+    # exact at MASK_DOWNSAMPLE=1, since dividing a box's pixel span by 1 never collapses
+    # it to a zero-size chip regardless of how small the box is.
     if args.mask_path and len(boxes) > 0 and mask_raster is not None:
-        with rasterio.open(args.raster_path) as src:
-            height, width = src.height, src.width
-        keep_box = []
         min_frac = max(0.0, float(args.min_cover_frac))
+        boxes_np = boxes.numpy()
 
-        for idx, b in enumerate(boxes.tolist()):
-            xmin, ymin, xmax, ymax = b
+        if is_main_process():
+            logger.info("[debug] filtering %d boxes by AOI mask", len(boxes_np))
 
-            # boxes are in global pixel coords already; clamp to raster bounds
-            c0 = int(max(0, min(width, min(xmin, xmax))))
-            c1 = int(max(0, min(width, max(xmin, xmax))))
-            r0 = int(max(0, min(height, min(ymin, ymax))))
-            r1 = int(max(0, min(height, max(ymin, ymax))))
+        keep_mask = filter_boxes_by_mask_raster(
+            mask_raster,
+            boxes_np,
+            min_cover_frac=min_frac,
+            row0=mask_meta["row0"],
+            col0=mask_meta["col0"],
+            downsample=mask_meta["downsample"],
+        )
+        keep_box = np.nonzero(keep_mask)[0].tolist()
 
-            if r1 <= r0 or c1 <= c0:
-                continue
-
-            # -------------------------------------------------
-            # convert full-res pixel coords → AOI mask coords
-            # -------------------------------------------------
-            mr0 = (r0 - mask_meta["row0"]) // mask_meta["downsample"]
-            mr1 = (r1 - mask_meta["row0"]) // mask_meta["downsample"]
-            mc0 = (c0 - mask_meta["col0"]) // mask_meta["downsample"]
-            mc1 = (c1 - mask_meta["col0"]) // mask_meta["downsample"]
-
-            # clip to mask raster bounds
-            hm, wm = mask_raster.shape
-            mr0 = max(0, min(hm, mr0))
-            mr1 = max(0, min(hm, mr1))
-            mc0 = max(0, min(wm, mc0))
-            mc1 = max(0, min(wm, mc1))
-
-            if mr1 <= mr0 or mc1 <= mc0:
-                continue
-
-            chip = mask_raster[mr0:mr1, mc0:mc1]
-            if chip.size == 0:
-                continue
-
-            cover = float(chip.sum()) / float(chip.size)
-            if cover >= min_frac and chip.sum() > 0:
-                keep_box.append(idx)
+        if is_main_process():
+            logger.info("[debug] AOI box filter kept %d of %d", len(keep_box), len(boxes_np))
 
         if keep_box:
             keep_t = torch.tensor(keep_box, dtype=torch.long)
@@ -497,7 +496,13 @@ def main():
     if args.task == 'instance_seg' and boxes.numel() > 0 and len(kept_masks_flat) > 0:
         for m_u8, tform, s, l in zip(kept_masks_flat, kept_tile_transforms, scores.tolist(), labels.tolist()):
             m_np = m_u8.numpy().astype('uint8')
-            for geom, val in rio_features.shapes(m_np, transform=tform):
+            # rasterio's shapes() uses GDAL's deprecated 'Memory' driver internally (GDAL >= 3.11
+            # warns "'Memory' driver is deprecated ... Use 'MEM' onwards"); this is a cosmetic
+            # upstream warning with no effect on correctness, silenced here to avoid log noise.
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=".*'Memory' driver is deprecated.*")
+                shapes = list(rio_features.shapes(m_np, transform=tform))
+            for geom, val in shapes:
                 if int(val) == 0:
                     continue
                 from shapely.geometry import shape as shapely_shape
@@ -551,70 +556,10 @@ def main():
             merged = gpd.GeoDataFrame({"classname": [], "score": []}, geometry=[], crs=crs)
 
 
-        # fast raster mask keep-only at polygon level (no costly overlay)
-        if args.mask_path:
-            with rasterio.open(args.raster_path) as src:
-                transform = src.transform
-
-            keep_idx = []
-            min_frac = max(0.0, float(args.min_cover_frac))
-
-            # mask dimensions (AOI-clipped, downsampled)
-            hm, wm = mask_raster.shape
-            row0 = mask_meta["row0"]
-            col0 = mask_meta["col0"]
-            ds = mask_meta["downsample"]
-
-            for i, geom in enumerate(merged.geometry):
-                if geom is None or geom.is_empty:
-                    continue
-
-                # -----------------------------------------
-                # polygon bounds → pixel coords (full-res)
-                # -----------------------------------------
-                minx, miny, maxx, maxy = geom.bounds
-                inv = ~transform
-
-                c0, r0 = inv * (minx, miny)
-                c1, r1 = inv * (maxx, maxy)
-
-                cmin, cmax = sorted((int(c0), int(c1)))
-                rmin, rmax = sorted((int(r0), int(r1)))
-
-                if rmax <= rmin or cmax <= cmin:
-                    continue
-
-                # ------------------------------------------------
-                # full-res pixel coords → AOI mask coords
-                # ------------------------------------------------
-                mrmin = (rmin - row0) // ds
-                mrmax = (rmax - row0) // ds
-                mcmin = (cmin - col0) // ds
-                mcmax = (cmax - col0) // ds
-
-                # clip to mask raster bounds
-                mrmin = max(0, min(hm, mrmin))
-                mrmax = max(0, min(hm, mrmax))
-                mcmin = max(0, min(wm, mcmin))
-                mcmax = max(0, min(wm, mcmax))
-
-                if mrmax <= mrmin or mcmax <= mcmin:
-                    continue
-
-                chip = mask_raster[mrmin:mrmax, mcmin:mcmax]
-                if chip.size == 0:
-                    continue
-
-                cover = float(chip.sum()) / float(chip.size)
-                if cover >= min_frac and chip.sum() > 0:
-                    keep_idx.append(i)
-
-            merged = merged.iloc[keep_idx].copy() if keep_idx else merged.iloc[0:0].copy()
-            logger.info(
-                "[debug] final masking kept %d of %d features",
-                len(merged),
-                sum(len(x) for x in gdfs) if gdfs else 0,
-            )
+        # AOI enforcement already happened exactly (via filter_boxes_by_mask_raster()) at
+        # the pre-vectorization, per-rank box-filtering step above, so each rank's partial
+        # file is already AOI-filtered — no need to re-filter merged results here with
+        # the coarse raster mask.
 
         # final fast dedupe: class-wise nms over polygon bounding boxes
         if len(merged) > 1:
@@ -679,7 +624,7 @@ def main():
         os.makedirs(os.path.dirname(final_path) or ".", exist_ok=True)
         merged.to_file(final_path, driver="GPKG", layer=layer_name)
         logger.info("[done] wrote %d features → %s (elapsed %.2fs)",
-                    post_count, final_path, time.time() - t0)
+                    post_bg_filter, final_path, time.time() - t0)
 
 
     if dist.is_initialized():
