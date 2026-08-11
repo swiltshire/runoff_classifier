@@ -343,6 +343,7 @@ def prepare_multicounty_training(
     positive_ratio: int = 80,
     in_class_ratio: int = 50,
     include_background: bool = True,
+    background_ratio: int = None,
 ) -> None:
     """
     Prepare a multi-county training dataset:
@@ -394,6 +395,13 @@ def prepare_multicounty_training(
         sized via positive_ratio/in_class_ratio. If False, keeps ONLY confirmed
         positives (VerifiedTr==1 focus_class) — no Background class, no negatives at
         all. positive_ratio/in_class_ratio are ignored in this case.
+    background_ratio : int, optional
+        For multi-class mode only (single_class=False): caps the relabeled Background
+        pool (VerifiedTr==0 rows) so it's at most `background_ratio`% of the final
+        combined dataset (confirmed real-class rows + kept Background rows). Excess
+        Background rows are randomly downsampled (never upsampled). Default None means
+        no cap — all VerifiedTr==0 rows are kept as Background (prior behavior).
+        Ignored in single-class mode.
     """
 
     county_data_dir = Path(county_data_dir)
@@ -575,11 +583,35 @@ def prepare_multicounty_training(
         # rows. Relabel those unconfirmed rows to an explicit "Background" class here so
         # they're trained as real (correctly-boxed) hard-negative/distractor examples
         # rather than silently leaking in as if they were confirmed instances of their
-        # original class.
+        # original class. Optionally cap Background's volume (background_ratio) so it
+        # doesn't dwarf the real classes.
         if "VerifiedTr" in merged.columns:
-            n_relabeled = int((merged["VerifiedTr"] == 0).sum())
-            merged.loc[merged["VerifiedTr"] == 0, "Classname"] = "Background"
-            _log(f"Multi-class mode: relabeled {n_relabeled} unconfirmed (VerifiedTr=0) rows to 'Background'")
+            merged_crs = merged.crs
+            is_background = merged["VerifiedTr"] == 0
+            background_rows = merged[is_background]
+            confirmed_rows = merged[~is_background]
+            n_available = len(background_rows)
+
+            if background_ratio is not None:
+                if not (1 <= background_ratio <= 99):
+                    _fail(f"background_ratio must be between 1 and 99, got {background_ratio}")
+                n_confirmed = len(confirmed_rows)
+                n_target = int(n_confirmed * background_ratio / (100 - background_ratio))
+                n_keep = min(n_target, n_available)
+                if n_keep < n_available:
+                    background_rows = background_rows.sample(n=n_keep, random_state=42)
+                _log(f"Multi-class mode: capping Background to ~{background_ratio}% of total "
+                     f"({n_keep} of {n_available} unconfirmed rows kept, {n_available - n_keep} dropped)")
+            else:
+                _log(f"Multi-class mode: keeping all {n_available} unconfirmed (VerifiedTr=0) rows as Background (no cap)")
+
+            background_rows = background_rows.copy()
+            background_rows["Classname"] = "Background"
+            merged = gpd.GeoDataFrame(
+                pd.concat([confirmed_rows, background_rows], ignore_index=True),
+                geometry="geometry",
+                crs=merged_crs,
+            )
 
         _log("Multi-class mode. Final class distribution:")
         print(merged["Classname"].value_counts())

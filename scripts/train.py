@@ -23,7 +23,7 @@ if PROJECT_ROOT not in sys.path:
 from src.utils.crs_utils import normalize_labels_crs
 from src.models.model import build_fasterrcnn_model, build_maskrcnn_model
 from src.data.dataset import ObjectDetectionTilesDataset, detection_collate_fn
-from src.data.sampling import StratifiedWeightedSampler
+from src.data.sampling import StratifiedWeightedSampler, DistributedWeightedSampler
 from src.utils.tiling import make_label_centered_training_windows
 
 
@@ -188,7 +188,13 @@ def main():
         include_masks=(args.task == 'instance_seg'),
     )
 
-    if dist.is_available() and dist.is_initialized():
+    if dist.is_available() and dist.is_initialized() and args.stratified_sampling:
+        # DDP-aware class-frequency-weighted sampling: plain DistributedSampler below
+        # only shuffles uniformly and silently ignores --stratified_sampling, so this
+        # must be checked before the DDP branch or class rebalancing never engages.
+        sampler = DistributedWeightedSampler(dataset, args.labels_path, classname_field='Classname')
+        shuffle = False
+    elif dist.is_available() and dist.is_initialized():
         sampler = DistributedSampler(dataset, shuffle=True, drop_last=True)
         shuffle = False
     elif args.stratified_sampling:
