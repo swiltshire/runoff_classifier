@@ -32,7 +32,13 @@ if PROJECT_ROOT not in sys.path:
 
 from src.models.model import build_fasterrcnn_model, build_maskrcnn_model
 from src.utils.tiling import make_grid_windows, adjust_boxes_to_global
-from src.utils.fast_mask import get_mask_clipped, filter_windows_by_mask_raster, clear_mask_cache
+from src.utils.fast_mask import (
+    get_mask_clipped,
+    filter_windows_by_mask_raster,
+    clear_mask_cache,
+    load_aoi_gdf,
+    aoi_cover_fraction,
+)
 from src.utils.make_vrt import write_mosaic_vrt
 
 # ---------------------------
@@ -257,6 +263,7 @@ def main():
     # -----------------------------
     mask_raster = None
     mask_meta = None
+    aoi_gdf = None
 
     if args.mask_path:
         if is_main_process():
@@ -298,6 +305,13 @@ def main():
                 len(windows_all),
                 total_before,
             )
+
+        # Load AOI polygons once per rank for exact (non-rasterized) per-detection
+        # overlap tests later (see aoi_cover_fraction()) — avoids the small-object
+        # blind spot inherent to a downsampled raster mask lookup.
+        with rasterio.open(args.raster_path) as src:
+            raster_crs = src.crs
+        aoi_gdf = load_aoi_gdf(args.mask_path, raster_crs)
 
     if is_main_process():
         logger.info(
@@ -430,49 +444,24 @@ def main():
         kept_masks_flat = []
         kept_tile_transforms = []
 
-    # fast box-level mask enforcement (pre-vectorization) to drop obviously out-of-AOI detections
-    if args.mask_path and len(boxes) > 0 and mask_raster is not None:
+    # exact (non-rasterized) AOI enforcement (pre-vectorization) to drop out-of-AOI detections.
+    # Uses true geometric overlap against the AOI polygons instead of a downsampled raster-mask
+    # lookup, so small objects (e.g. Tile_Outlet, often <16px) are never spuriously rejected due
+    # to collapsing to a zero-size span in a coarse mask grid.
+    if args.mask_path and len(boxes) > 0 and aoi_gdf is not None:
         with rasterio.open(args.raster_path) as src:
-            height, width = src.height, src.width
+            box_transform = src.transform
         keep_box = []
         min_frac = max(0.0, float(args.min_cover_frac))
 
         for idx, b in enumerate(boxes.tolist()):
             xmin, ymin, xmax, ymax = b
+            x0, y0 = box_transform * (xmin, ymin)
+            x1, y1 = box_transform * (xmax, ymax)
+            box_geom = shapely_box(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
 
-            # boxes are in global pixel coords already; clamp to raster bounds
-            c0 = int(max(0, min(width, min(xmin, xmax))))
-            c1 = int(max(0, min(width, max(xmin, xmax))))
-            r0 = int(max(0, min(height, min(ymin, ymax))))
-            r1 = int(max(0, min(height, max(ymin, ymax))))
-
-            if r1 <= r0 or c1 <= c0:
-                continue
-
-            # -------------------------------------------------
-            # convert full-res pixel coords → AOI mask coords
-            # -------------------------------------------------
-            mr0 = (r0 - mask_meta["row0"]) // mask_meta["downsample"]
-            mr1 = (r1 - mask_meta["row0"]) // mask_meta["downsample"]
-            mc0 = (c0 - mask_meta["col0"]) // mask_meta["downsample"]
-            mc1 = (c1 - mask_meta["col0"]) // mask_meta["downsample"]
-
-            # clip to mask raster bounds
-            hm, wm = mask_raster.shape
-            mr0 = max(0, min(hm, mr0))
-            mr1 = max(0, min(hm, mr1))
-            mc0 = max(0, min(wm, mc0))
-            mc1 = max(0, min(wm, mc1))
-
-            if mr1 <= mr0 or mc1 <= mc0:
-                continue
-
-            chip = mask_raster[mr0:mr1, mc0:mc1]
-            if chip.size == 0:
-                continue
-
-            cover = float(chip.sum()) / float(chip.size)
-            if cover >= min_frac and chip.sum() > 0:
+            frac = aoi_cover_fraction(box_geom, aoi_gdf)
+            if frac > 0.0 and frac >= min_frac:
                 keep_box.append(idx)
 
         if keep_box:
@@ -551,70 +540,10 @@ def main():
             merged = gpd.GeoDataFrame({"classname": [], "score": []}, geometry=[], crs=crs)
 
 
-        # fast raster mask keep-only at polygon level (no costly overlay)
-        if args.mask_path:
-            with rasterio.open(args.raster_path) as src:
-                transform = src.transform
-
-            keep_idx = []
-            min_frac = max(0.0, float(args.min_cover_frac))
-
-            # mask dimensions (AOI-clipped, downsampled)
-            hm, wm = mask_raster.shape
-            row0 = mask_meta["row0"]
-            col0 = mask_meta["col0"]
-            ds = mask_meta["downsample"]
-
-            for i, geom in enumerate(merged.geometry):
-                if geom is None or geom.is_empty:
-                    continue
-
-                # -----------------------------------------
-                # polygon bounds → pixel coords (full-res)
-                # -----------------------------------------
-                minx, miny, maxx, maxy = geom.bounds
-                inv = ~transform
-
-                c0, r0 = inv * (minx, miny)
-                c1, r1 = inv * (maxx, maxy)
-
-                cmin, cmax = sorted((int(c0), int(c1)))
-                rmin, rmax = sorted((int(r0), int(r1)))
-
-                if rmax <= rmin or cmax <= cmin:
-                    continue
-
-                # ------------------------------------------------
-                # full-res pixel coords → AOI mask coords
-                # ------------------------------------------------
-                mrmin = (rmin - row0) // ds
-                mrmax = (rmax - row0) // ds
-                mcmin = (cmin - col0) // ds
-                mcmax = (cmax - col0) // ds
-
-                # clip to mask raster bounds
-                mrmin = max(0, min(hm, mrmin))
-                mrmax = max(0, min(hm, mrmax))
-                mcmin = max(0, min(wm, mcmin))
-                mcmax = max(0, min(wm, mcmax))
-
-                if mrmax <= mrmin or mcmax <= mcmin:
-                    continue
-
-                chip = mask_raster[mrmin:mrmax, mcmin:mcmax]
-                if chip.size == 0:
-                    continue
-
-                cover = float(chip.sum()) / float(chip.size)
-                if cover >= min_frac and chip.sum() > 0:
-                    keep_idx.append(i)
-
-            merged = merged.iloc[keep_idx].copy() if keep_idx else merged.iloc[0:0].copy()
-            logger.info(
-                "[debug] final masking kept %d of %d features",
-                len(merged),
-                sum(len(x) for x in gdfs) if gdfs else 0,
-            )
+        # AOI enforcement already happened exactly (via aoi_cover_fraction()) at the
+        # pre-vectorization, per-rank box-filtering step above, so each rank's partial
+        # file is already AOI-filtered — no need to re-filter merged results here with
+        # the coarse raster mask.
 
         # final fast dedupe: class-wise nms over polygon bounding boxes
         if len(merged) > 1:

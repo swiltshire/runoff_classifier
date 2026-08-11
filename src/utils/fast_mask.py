@@ -240,3 +240,36 @@ def filter_windows_by_mask_raster(
 
     return kept
 
+
+def load_aoi_gdf(mask_path: str, raster_crs) -> gpd.GeoDataFrame:
+    """
+    Load AOI polygons once, reprojected to the raster's CRS, with an eagerly-built
+    spatial index for fast exact overlap tests (see aoi_cover_fraction()).
+    """
+    gdf = gpd.read_file(mask_path)
+    if gdf.crs != raster_crs:
+        gdf = gdf.to_crs(raster_crs)
+    gdf = gdf[gdf.geometry.notnull() & ~gdf.geometry.is_empty].reset_index(drop=True)
+    _ = gdf.sindex  # build spatial index eagerly
+    return gdf
+
+
+def aoi_cover_fraction(geom, aoi_gdf: gpd.GeoDataFrame) -> float:
+    """
+    Exact AOI coverage fraction for a single geometry (e.g. a detection box or polygon),
+    computed via true geometric intersection rather than a downsampled raster mask lookup.
+
+    Unlike the rasterized-mask approach used by filter_windows_by_mask_raster() (fine for
+    large windows, but blind to objects smaller than one downsampled cell), this has no
+    minimum-object-size limitation: it gives a geometrically correct answer regardless of
+    how small `geom` is.
+    """
+    if geom is None or geom.is_empty or geom.area <= 0:
+        return 0.0
+    candidate_idx = list(aoi_gdf.sindex.query(geom, predicate="intersects"))
+    if not candidate_idx:
+        return 0.0
+    overlap = aoi_gdf.geometry.iloc[candidate_idx].intersection(geom).area.sum()
+    overlap = min(overlap, geom.area)  # guard against double-counting overlapping AOI polygons
+    return overlap / geom.area
+
