@@ -37,7 +37,7 @@ from src.utils.fast_mask import (
     filter_windows_by_mask_raster,
     clear_mask_cache,
     load_aoi_gdf,
-    aoi_cover_fraction,
+    aoi_cover_fractions_bulk,
 )
 from src.utils.make_vrt import write_mosaic_vrt
 
@@ -451,18 +451,23 @@ def main():
     if args.mask_path and len(boxes) > 0 and aoi_gdf is not None:
         with rasterio.open(args.raster_path) as src:
             box_transform = src.transform
-        keep_box = []
         min_frac = max(0.0, float(args.min_cover_frac))
 
-        for idx, b in enumerate(boxes.tolist()):
+        box_geoms = []
+        for b in boxes.tolist():
             xmin, ymin, xmax, ymax = b
             x0, y0 = box_transform * (xmin, ymin)
             x1, y1 = box_transform * (xmax, ymax)
-            box_geom = shapely_box(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+            box_geoms.append(shapely_box(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)))
 
-            frac = aoi_cover_fraction(box_geom, aoi_gdf)
-            if frac > 0.0 and frac >= min_frac:
-                keep_box.append(idx)
+        if is_main_process():
+            logger.info("[debug] computing exact AOI overlap for %d boxes (vectorized)", len(box_geoms))
+
+        fracs = aoi_cover_fractions_bulk(box_geoms, aoi_gdf)
+        keep_box = [idx for idx, frac in enumerate(fracs) if frac > 0.0 and frac >= min_frac]
+
+        if is_main_process():
+            logger.info("[debug] AOI box filter kept %d of %d", len(keep_box), len(box_geoms))
 
         if keep_box:
             keep_t = torch.tensor(keep_box, dtype=torch.long)

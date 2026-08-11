@@ -263,6 +263,11 @@ def aoi_cover_fraction(geom, aoi_gdf: gpd.GeoDataFrame) -> float:
     large windows, but blind to objects smaller than one downsampled cell), this has no
     minimum-object-size limitation: it gives a geometrically correct answer regardless of
     how small `geom` is.
+
+    NOTE: for filtering many geometries at once (e.g. all detection boxes in a rank),
+    use aoi_cover_fractions_bulk() instead - calling this function in a Python loop over
+    thousands of boxes incurs per-call pandas/GEOS overhead that can turn into a
+    multi-minute (or longer) stall.
     """
     if geom is None or geom.is_empty or geom.area <= 0:
         return 0.0
@@ -272,4 +277,55 @@ def aoi_cover_fraction(geom, aoi_gdf: gpd.GeoDataFrame) -> float:
     overlap = aoi_gdf.geometry.iloc[candidate_idx].intersection(geom).area.sum()
     overlap = min(overlap, geom.area)  # guard against double-counting overlapping AOI polygons
     return overlap / geom.area
+
+
+def aoi_cover_fractions_bulk(geoms, aoi_gdf: gpd.GeoDataFrame) -> np.ndarray:
+    """
+    Vectorized version of aoi_cover_fraction() for many geometries at once.
+
+    Calling aoi_cover_fraction() in a Python loop over thousands of detection boxes is
+    dominated by per-call Python/pandas overhead (a fresh sindex.query() call, a pandas
+    .iloc[] row selection, and a GeoSeries.intersection() call, each time), not by the
+    actual geometric work. This does the equivalent computation with a single bulk
+    spatial-index query plus shapely's vectorized (ufunc) area/intersection operations,
+    which run over numpy arrays of geometries in C rather than one call at a time.
+
+    Parameters
+    ----------
+    geoms : sequence of shapely geometries
+        e.g. one box per surviving detection, in the same CRS as aoi_gdf.
+    aoi_gdf : GeoDataFrame
+        AOI polygons as returned by load_aoi_gdf() (already has an eager sindex).
+
+    Returns
+    -------
+    np.ndarray of float64, shape (len(geoms),)
+        Coverage fraction [0..1] for each input geometry, in the same order.
+    """
+    import shapely
+
+    n = len(geoms)
+    fracs = np.zeros(n, dtype=np.float64)
+    if n == 0:
+        return fracs
+
+    geoms_arr = np.asarray(geoms, dtype=object)
+    areas = shapely.area(geoms_arr)
+
+    # bulk sindex query: returns (input_idx, tree_idx) arrays of matching pairs in one call
+    input_idx, tree_idx = aoi_gdf.sindex.query(geoms_arr, predicate="intersects")
+    if len(input_idx) == 0:
+        return fracs
+
+    aoi_geoms = aoi_gdf.geometry.to_numpy()[tree_idx]
+    inter_areas = shapely.area(shapely.intersection(geoms_arr[input_idx], aoi_geoms))
+
+    # sum overlap area per input geometry (a geometry may match multiple AOI polygons)
+    overlap_sums = np.zeros(n, dtype=np.float64)
+    np.add.at(overlap_sums, input_idx, inter_areas)
+
+    valid = areas > 0
+    # guard against double-counting overlapping AOI polygons
+    fracs[valid] = np.minimum(overlap_sums[valid], areas[valid]) / areas[valid]
+    return fracs
 
