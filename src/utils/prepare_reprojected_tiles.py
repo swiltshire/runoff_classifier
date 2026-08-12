@@ -234,24 +234,33 @@ def archive_and_prune_raw_tiles(tile_paths: List[Path]) -> None:
     the local copy - so a native-CRS group's raw tiles don't have to coexist
     locally with the canonical output generated from them."""
     verified: List[Path] = []
-    for tile_path in tile_paths:
-        county_safe = tile_path.parent.parent.name
-        key = raw_tile_s3_key(county_safe, tile_path.name)
-        local_size = tile_path.stat().st_size
+    uploaded = already_archived = 0
+    with tqdm(total=len(tile_paths), unit="tile", desc="  archiving raw tiles") as pbar:
+        for tile_path in tile_paths:
+            county_safe = tile_path.parent.parent.name
+            key = raw_tile_s3_key(county_safe, tile_path.name)
+            local_size = tile_path.stat().st_size
 
-        if not s3_exists(S3_BUCKET, key):
-            upload_to_s3(tile_path, S3_BUCKET, key)
+            if s3_exists(S3_BUCKET, key):
+                already_archived += 1
+            else:
+                upload_to_s3(tile_path, S3_BUCKET, key)
+                uploaded += 1
 
-        try:
-            head = s3.head_object(Bucket=S3_BUCKET, Key=key)
-            if head["ContentLength"] != local_size:
-                log(f"  \u26a0 WARNING: archive size mismatch for {tile_path.name} - not deleting local copy")
+            try:
+                head = s3.head_object(Bucket=S3_BUCKET, Key=key)
+                if head["ContentLength"] != local_size:
+                    log(f"  \u26a0 WARNING: archive size mismatch for {tile_path.name} - not deleting local copy")
+                    pbar.update(1)
+                    continue
+            except Exception as e:
+                log(f"  \u26a0 WARNING: could not verify archive for {tile_path.name} ({e}) - not deleting local copy")
+                pbar.update(1)
                 continue
-        except Exception as e:
-            log(f"  \u26a0 WARNING: could not verify archive for {tile_path.name} ({e}) - not deleting local copy")
-            continue
 
-        verified.append(tile_path)
+            verified.append(tile_path)
+            pbar.update(1)
+            pbar.set_postfix(uploaded=uploaded, cached=already_archived)
 
     for tile_path in verified:
         try:
