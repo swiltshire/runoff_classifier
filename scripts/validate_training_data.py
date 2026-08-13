@@ -250,9 +250,14 @@ def validate_training_data(
 
             county_summary[county] = county_dist.to_dict()
 
+            if verbose:
+                _log(f"{county} ({county_total} features):", "INFO")
+
             # Check for extreme class imbalance in county (e.g., 100% one class)
             for cls, count in county_dist.items():
                 pct = 100 * count / county_total
+                if verbose:
+                    print(f"         {cls}: {pct:.1f}% ({count}/{county_total})")
                 if pct >= 95:
                     suspicious_counties.append((county, cls, pct))
 
