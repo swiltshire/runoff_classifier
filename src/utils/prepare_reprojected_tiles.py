@@ -69,6 +69,7 @@ newly-added counties.
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -382,6 +383,26 @@ def grid_cells_for_bounds(bounds: Tuple[float, float, float, float]) -> List[Tup
     row_end = math.floor((maxy - 1e-6) / chip_units)
     return [(r, c) for r in range(row_start, row_end + 1) for c in range(col_start, col_end + 1)]
 
+def _needed_cells_for_tiles(tiles: List[Path], epsg_code: str, buffer_chips: float = 0.0) -> Set[Tuple[int, int]]:
+    """Canonical grid cells actually covered by `tiles` - the UNION of each
+    tile's own footprint, NOT the group's overall bounding rectangle.
+
+    Using a single overall bbox (via _raster_bounds_native) is wrong whenever
+    a native-CRS group's tiles are sparse/scattered relative to their own
+    bounding rectangle: the bbox can span area that a DIFFERENT native-CRS
+    group's tiles actually cover, causing this group to also claim (and
+    generate a genuinely-blank chip for) a canonical cell that's really
+    covered by the other group. Computing per-tile means each group only
+    ever claims cells its own tiles actually touch. Same per-tile file-header
+    I/O cost as _raster_bounds_native (which already opens every tile)."""
+    cells: Set[Tuple[int, int]] = set()
+    for p in tiles:
+        with rasterio.open(p) as ds:
+            b = ds.bounds
+        canon_bounds = _bounds_to_canonical((b.left, b.bottom, b.right, b.top), epsg_code, buffer_chips=buffer_chips)
+        cells.update(grid_cells_for_bounds(canon_bounds))
+    return cells
+
 def chip_bounds(row: int, col: int) -> Tuple[float, float, float, float]:
     chip_units = CHIP_SIZE_PX * CANONICAL_RES
     minx = col * chip_units
@@ -648,18 +669,14 @@ def ensure_canonical_mosaic_for_counties(
         needed: Set[Tuple[str, int, int]] = set()
         for epsg_code, tiles in subgroups.items():
             relevant_epsgs.add(epsg_code)
-            native_bounds = _raster_bounds_native(tiles)
-            canon_bounds = _bounds_to_canonical(native_bounds, epsg_code, buffer_chips=0.0)
-            for (r, c) in grid_cells_for_bounds(canon_bounds):
+            for (r, c) in _needed_cells_for_tiles(tiles, epsg_code, buffer_chips=0.0):
                 needed.add((epsg_code, r, c))
         county_needed_cells[county_safe] = sorted(needed)
 
     for county_safe in new_counties_safe:
         subgroups = county_tiles_by_crs(county_safe)
         for epsg_code, tiles in subgroups.items():
-            native_bounds = _raster_bounds_native(tiles)
-            canon_bounds = _bounds_to_canonical(native_bounds, epsg_code, buffer_chips=BORDER_BUFFER_CHIPS)
-            for cell in grid_cells_for_bounds(canon_bounds):
+            for cell in _needed_cells_for_tiles(tiles, epsg_code, buffer_chips=BORDER_BUFFER_CHIPS):
                 force_cells[epsg_code].add(cell)
 
     if not relevant_epsgs:
@@ -839,3 +856,139 @@ def rescan_and_fix_blank_chips(counties: List[str], max_workers: int = 16) -> Di
         summary[county_safe] = {"fixed": fixed, "still_blank": still_blank}
 
     return summary
+
+CHIP_FILENAME_RE = re.compile(r"^chip_(\d+)_r(-?\d+)_c(-?\d+)\.tif$")
+
+def find_phantom_duplicate_chips(counties: List[str]) -> Dict[str, List[Dict]]:
+    """
+    Scan `counties`' materialized canonical_tiles/*.tif for the multi-CRS-
+    group phantom-duplicate bug (see ensure_canonical_mosaic_for_counties():
+    a native-CRS group's needed cells used to be computed from its overall
+    bounding rectangle rather than its tiles' actual footprint, so a sparse
+    secondary CRS group could wrongly claim - and generate a genuinely-blank
+    chip for - a canonical (row, col) cell that a DIFFERENT CRS group
+    actually covers).
+
+    For each canonical (row, col) cell that has files from more than one
+    epsg prefix, classifies the group:
+      - exactly one non-blank + the rest blank -> the blank one(s) are
+        phantom duplicates, flagged for cleanup.
+      - all blank, or more than one non-blank -> NOT flagged (a genuine
+        source gap, or a legitimate real overlap at a true CRS-zone
+        boundary, respectively) - just reported for visibility.
+
+    This only reads already-materialized canonical_tiles/*.tif files (no raw
+    tiles needed), so it works even for counties whose raw tiles have
+    already been archived+pruned.
+
+    Returns {county_safe: [{"row", "col", "epsg_code", "filename",
+    "local_path"} for every phantom chip found]}.
+    """
+    report: Dict[str, List[Dict]] = {}
+    for county in counties:
+        county_safe = safe_name(county.strip())
+        county_dir = project_root() / "data" / "counties" / county_safe / "canonical_tiles"
+        tile_paths = sorted(county_dir.glob("*.tif"))
+        if not tile_paths:
+            continue
+
+        by_cell: Dict[Tuple[int, int], List[Path]] = defaultdict(list)
+        for p in tile_paths:
+            m = CHIP_FILENAME_RE.match(p.name)
+            if not m:
+                continue
+            row, col = int(m.group(2)), int(m.group(3))
+            by_cell[(row, col)].append(p)
+
+        dupe_cells = {cell: paths for cell, paths in by_cell.items() if len(paths) > 1}
+        if not dupe_cells:
+            continue
+
+        phantoms: List[Dict] = []
+        all_blank_cells = 0
+        multi_real_cells = 0
+        for (row, col), paths in dupe_cells.items():
+            blank_flags = {p: is_fully_blank(p) for p in paths}
+            non_blank = [p for p, blank in blank_flags.items() if not blank]
+            if len(non_blank) == 1:
+                for p in paths:
+                    if blank_flags[p]:
+                        m = CHIP_FILENAME_RE.match(p.name)
+                        epsg_num = m.group(1)
+                        phantoms.append({
+                            "row": row,
+                            "col": col,
+                            "epsg_code": f"EPSG:{epsg_num}",
+                            "filename": p.name,
+                            "local_path": p,
+                        })
+            elif len(non_blank) == 0:
+                all_blank_cells += 1
+            else:
+                multi_real_cells += 1
+
+        if phantoms or all_blank_cells or multi_real_cells:
+            log(f"{county}: {len(dupe_cells)} canonical cell(s) with >1 epsg-prefixed chip - "
+                f"{len(phantoms)} confirmed phantom (blank duplicate), "
+                f"{all_blank_cells} all-blank (genuine gap, not a duplicate issue), "
+                f"{multi_real_cells} multiple-real-overlap (legitimate CRS-zone boundary, harmless)")
+        if phantoms:
+            report[county_safe] = phantoms
+
+    return report
+
+def delete_phantom_chips(phantom_report: Dict[str, List[Dict]], dry_run: bool = True) -> Dict[str, int]:
+    """
+    Delete phantom blank duplicate chips identified by
+    find_phantom_duplicate_chips() - removes the local canonical_tiles/*.tif
+    file and its S3 chip object, then rewrites that county's manifest
+    excluding the deleted cells.
+
+    Defaults to dry_run=True (report only, deletes nothing) - pass
+    dry_run=False explicitly to actually delete, since this removes S3 data
+    across every county in `phantom_report`.
+
+    Returns {county_safe: number of phantom chips deleted (0 if dry_run)}.
+    """
+    deleted_counts: Dict[str, int] = {}
+    for county_safe, phantoms in phantom_report.items():
+        if not phantoms:
+            continue
+
+        if dry_run:
+            log(f"[DRY RUN] {county_safe}: would delete {len(phantoms)} phantom chip(s): "
+                f"{[p['filename'] for p in phantoms]}")
+            deleted_counts[county_safe] = 0
+            continue
+
+        county_dir = project_root() / "data" / "counties" / county_safe / "canonical_tiles"
+        deleted = 0
+        for p in phantoms:
+            local_path: Path = p["local_path"]
+            epsg_code, row, col = p["epsg_code"], p["row"], p["col"]
+            key = chip_s3_key(epsg_code, row, col)
+            try:
+                if local_path.exists():
+                    local_path.unlink()
+                s3.delete_object(Bucket=S3_BUCKET, Key=key)
+                deleted += 1
+            except Exception as e:
+                log(f"  ✗ {county_safe}: failed to delete phantom chip {p['filename']}: {e}")
+        log(f"{county_safe}: deleted {deleted}/{len(phantoms)} phantom chip(s)")
+        deleted_counts[county_safe] = deleted
+
+        # rewrite this county's manifest excluding the deleted cells
+        deleted_cells = {(p["epsg_code"], p["row"], p["col"]) for p in phantoms}
+        remaining_tiles = sorted(county_dir.glob("*.tif")) if county_dir.is_dir() else []
+        remaining_cells: List[Tuple[str, int, int]] = []
+        for tp in remaining_tiles:
+            m = CHIP_FILENAME_RE.match(tp.name)
+            if not m:
+                continue
+            epsg_num, row, col = m.group(1), int(m.group(2)), int(m.group(3))
+            cell = (f"EPSG:{epsg_num}", row, col)
+            if cell not in deleted_cells:
+                remaining_cells.append(cell)
+        write_county_manifest(county_safe, county_safe, remaining_cells)
+
+    return deleted_counts
