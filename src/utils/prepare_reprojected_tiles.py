@@ -446,9 +446,11 @@ def _blank_chip_log_path() -> Path:
     return p
 
 
-def _is_fully_blank(path: Path) -> bool:
+def is_fully_blank(path: Path) -> bool:
     """True if every pixel in `path` is NoData (or exactly zero, when no
-    NoData value is set) across all bands."""
+    NoData value is set) across all bands. Public - also used directly by
+    notebook diagnostics (e.g. the "Validate inference imagery" cell) to
+    flag 100%-blank canonical tiles."""
     with rasterio.open(path) as src:
         arr = src.read()
         nodata_val = src.nodata
@@ -514,7 +516,7 @@ def _crop_and_cache_chip(job: Dict) -> Dict[str, int]:
         # S3 forever with no way to tell later. Log it so it can be found
         # and retried via rescan_and_fix_blank_chips() once raw coverage
         # might have improved, without blocking/slowing this run.
-        if _is_fully_blank(local_path):
+        if is_fully_blank(local_path):
             print(f"  \u26a0 WARNING: chip {s3_key} generated fully blank/NoData - caching anyway, "
                   f"logged to {_blank_chip_log_path()} for later rescan")
             _log_blank_chip(epsg_code, row, col, s3_key)
@@ -787,6 +789,7 @@ def rescan_and_fix_blank_chips(counties: List[str], max_workers: int = 16) -> Di
     Returns {county_safe: {"fixed": [chip names], "still_blank": [chip names]}}.
     """
     summary: Dict[str, Dict[str, List[str]]] = {}
+    workers = max(1, min(max_workers, os.cpu_count() or 1))
 
     for county in counties:
         county_safe = safe_name(county.strip())
@@ -796,7 +799,20 @@ def rescan_and_fix_blank_chips(counties: List[str], max_workers: int = 16) -> Di
             log(f"{county}: no canonical tiles found at {county_dir} - skipping")
             continue
 
-        blank_before = [p.name for p in tile_paths if _is_fully_blank(p)]
+        log(f"{county}: scanning {len(tile_paths)} chip(s) at full resolution for blank/NoData content "
+            f"({workers} parallel workers - each chip is a full read, so this can take a while for a "
+            f"large county)...")
+        blank_before = []
+        with tqdm(total=len(tile_paths), unit="chip", desc=f"{county}: scanning for blanks") as pbar:
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                future_to_path = {executor.submit(is_fully_blank, p): p for p in tile_paths}
+                for fut in as_completed(future_to_path):
+                    p = future_to_path[fut]
+                    if fut.result():
+                        blank_before.append(p.name)
+                    pbar.update(1)
+                    pbar.set_postfix(blank=len(blank_before))
+
         if not blank_before:
             log(f"{county}: {len(tile_paths)} chips checked, none blank - nothing to fix")
             summary[county_safe] = {"fixed": [], "still_blank": []}
@@ -809,10 +825,11 @@ def rescan_and_fix_blank_chips(counties: List[str], max_workers: int = 16) -> Di
 
         ensure_canonical_mosaic_for_counties(counties=[county], force=True, max_workers=max_workers)
 
+        log(f"{county}: re-checking the {len(blank_before)} previously-blank chip(s)...")
         fixed, still_blank = [], []
         for name in blank_before:
             p = county_dir / name
-            if p.exists() and not _is_fully_blank(p):
+            if p.exists() and not is_fully_blank(p):
                 fixed.append(name)
             else:
                 still_blank.append(name)
