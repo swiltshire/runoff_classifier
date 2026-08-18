@@ -74,10 +74,12 @@ import subprocess
 import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
 import boto3
+import numpy as np
 import rasterio
 from rasterio.warp import transform_bounds
 from tqdm import tqdm
@@ -423,6 +425,56 @@ def build_warped_vrt(native_vrt: Path, epsg_code: str) -> Path:
     return out_vrt
 
 # ---------------------------------------------------------------------
+# Blank-chip detection + logging
+#
+# The chip cache is keyed only by (epsg, row, col) and reused indefinitely
+# (see module docstring). If a raw tile silently fails to download (see
+# indiana_cogs.download_6in_tiles's failed-download warning above) or a
+# CRS group's native mosaic otherwise has a transient gap, the chip cropped
+# from that gap is all-NoData and gets cached in S3 forever - nothing else
+# in the pipeline ever revisits it. These helpers make that condition
+# visible at generation time and queryable later via
+# `rescan_and_fix_blank_chips()`.
+# ---------------------------------------------------------------------
+
+BLANK_CHIP_LOG_PATH = None  # set lazily via _blank_chip_log_path()
+
+
+def _blank_chip_log_path() -> Path:
+    p = project_root() / "outputs" / "blank_chip_log.json"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _is_fully_blank(path: Path) -> bool:
+    """True if every pixel in `path` is NoData (or exactly zero, when no
+    NoData value is set) across all bands."""
+    with rasterio.open(path) as src:
+        arr = src.read()
+        nodata_val = src.nodata
+        if nodata_val is not None:
+            return bool(np.all(arr == nodata_val))
+        return bool(np.all(arr == 0))
+
+
+def _log_blank_chip(epsg_code: str, row: int, col: int, s3_key: str) -> None:
+    log_path = _blank_chip_log_path()
+    entries = []
+    if log_path.exists():
+        try:
+            entries = json.loads(log_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            entries = []
+    entries.append({
+        "epsg": epsg_code,
+        "row": row,
+        "col": col,
+        "s3_key": s3_key,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    log_path.write_text(json.dumps(entries, indent=2))
+
+# ---------------------------------------------------------------------
 # Per-chip crop worker (top-level function so it is picklable for
 # ProcessPoolExecutor)
 # ---------------------------------------------------------------------
@@ -455,6 +507,18 @@ def _crop_and_cache_chip(job: Dict) -> Dict[str, int]:
         ]
         subprocess.check_call(cmd)
         stats["generated"] = 1
+
+        # A freshly-cropped chip that comes out fully blank is suspicious (a
+        # gap in the native mosaic - e.g. from a silently-failed raw tile
+        # download) rather than expected, and will otherwise get cached in
+        # S3 forever with no way to tell later. Log it so it can be found
+        # and retried via rescan_and_fix_blank_chips() once raw coverage
+        # might have improved, without blocking/slowing this run.
+        if _is_fully_blank(local_path):
+            print(f"  \u26a0 WARNING: chip {s3_key} generated fully blank/NoData - caching anyway, "
+                  f"logged to {_blank_chip_log_path()} for later rescan")
+            _log_blank_chip(epsg_code, row, col, s3_key)
+
         upload_to_s3(local_path, S3_BUCKET, s3_key)
 
     # Materialize into every requesting county's canonical_tiles/ folder as a
@@ -552,10 +616,19 @@ def ensure_canonical_mosaic_for_counties(
             log(f"  ⚠ WARNING: no pinned imagery year for {county} - falling back to auto-detect")
 
         try:
-            download_6in_tiles(county, max_workers=max_workers, imagery_year=pinned_year)
+            download_result = download_6in_tiles(county, max_workers=max_workers, imagery_year=pinned_year)
         except Exception as e:
             log(f"  ✗ {county}: failed to download raw tiles: {e}")
             raise
+
+        if download_result.get("failed", 0) > 0:
+            log(
+                f"  ⚠ WARNING: {county}: {download_result['failed']} raw tile download(s) failed "
+                f"({download_result['year']} imagery) - the native mosaic for this area will have a "
+                f"gap where those tiles would have been, and any canonical chip cropped from that gap "
+                f"will be cached as blank/NoData. Re-run this county's download (or "
+                f"rescan_and_fix_blank_chips([...]) afterward) to repair it."
+            )
 
     # 2. group ALL locally-available raw tiles (every county ever
     #    downloaded) by native CRS, so every warp has maximum context.
@@ -688,3 +761,64 @@ def ensure_canonical_mosaic_for_counties(
     )
 
     return result_paths
+
+
+# ---------------------------------------------------------------------
+# Blank-chip rescan/repair utility
+# ---------------------------------------------------------------------
+
+def rescan_and_fix_blank_chips(counties: List[str], max_workers: int = 16) -> Dict[str, Dict[str, List[str]]]:
+    """
+    Scan `counties`' currently-materialized canonical_tiles/*.tif for chips
+    that are fully blank/NoData at full resolution, and - if any are found
+    for a county - force a full regeneration of that county's chips
+    (`ensure_canonical_mosaic_for_counties(counties=[county], force=True)`),
+    bypassing the stale S3 cache so each chip is re-cropped from the
+    CURRENT native raw-tile mosaic. Re-checks afterward and reports which
+    previously-blank chips came back with real content vs. are still blank
+    (the latter likely reflects a genuine source-imagery gap rather than a
+    pipeline caching issue).
+
+    This is the recommended remediation for chips that were cached blank
+    due to a since-resolved gap in raw tile coverage (e.g. a transient
+    download failure - see the loud warning now emitted by
+    `download_6in_tiles()`/`ensure_canonical_mosaic_for_counties()`).
+
+    Returns {county_safe: {"fixed": [chip names], "still_blank": [chip names]}}.
+    """
+    summary: Dict[str, Dict[str, List[str]]] = {}
+
+    for county in counties:
+        county_safe = safe_name(county.strip())
+        county_dir = project_root() / "data" / "counties" / county_safe / "canonical_tiles"
+        tile_paths = sorted(county_dir.glob("*.tif"))
+        if not tile_paths:
+            log(f"{county}: no canonical tiles found at {county_dir} - skipping")
+            continue
+
+        blank_before = [p.name for p in tile_paths if _is_fully_blank(p)]
+        if not blank_before:
+            log(f"{county}: {len(tile_paths)} chips checked, none blank - nothing to fix")
+            summary[county_safe] = {"fixed": [], "still_blank": []}
+            continue
+
+        log(f"{county}: {len(blank_before)}/{len(tile_paths)} chip(s) currently blank - "
+            f"force-regenerating this county's chips from the current native mosaic...")
+        for name in blank_before:
+            log(f"    - {name}")
+
+        ensure_canonical_mosaic_for_counties(counties=[county], force=True, max_workers=max_workers)
+
+        fixed, still_blank = [], []
+        for name in blank_before:
+            p = county_dir / name
+            if p.exists() and not _is_fully_blank(p):
+                fixed.append(name)
+            else:
+                still_blank.append(name)
+
+        log(f"{county}: {len(fixed)} chip(s) fixed, {len(still_blank)} still blank "
+            f"(likely a genuine source-imagery gap rather than a caching issue)")
+        summary[county_safe] = {"fixed": fixed, "still_blank": still_blank}
+
+    return summary

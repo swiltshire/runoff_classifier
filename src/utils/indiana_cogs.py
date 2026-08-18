@@ -907,21 +907,26 @@ def download_6in_tiles(county: str, max_workers: int = 16, imagery_year: Optiona
 
     # progress bar
     downloaded = resumed = skipped = failed = 0
+    failed_files = []
     year_source = "specified" if imagery_year is not None else "auto-detected"
     desc = f"{county_dir} 06in tiles ({year}, {year_source})"
 
     with tqdm(total=len(jobs), unit="file", desc=desc) as pbar:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(download_one, url, dest, s) for url, dest in jobs]
-            for fut in as_completed(futures):
+            future_to_job = {pool.submit(download_one, url, dest, s): (url, dest) for url, dest in jobs}
+            for fut in as_completed(future_to_job):
+                url, dest = future_to_job[fut]
                 try:
                     res = fut.result(timeout=120)
                     if res == "downloaded": downloaded += 1
                     elif res == "resumed": resumed += 1
                     elif res == "skipped": skipped += 1
-                    else: failed += 1
-                except:
+                    else:
+                        failed += 1
+                        failed_files.append((dest.name, url))
+                except Exception:
                     failed += 1
+                    failed_files.append((dest.name, url))
                 finally:
                     pbar.update(1)
                     pbar.set_postfix({
@@ -930,6 +935,14 @@ def download_6in_tiles(county: str, max_workers: int = 16, imagery_year: Optiona
                         "skip": skipped,
                         "fail": failed
                     })
+
+    if failed_files:
+        print(f"\n⚠ WARNING: {len(failed_files)}/{len(jobs)} raw tile download(s) FAILED for "
+              f"{county} ({year}) - the resulting native-CRS mosaic for this area will have a "
+              f"gap wherever these tiles would have been, which can produce a permanently-cached "
+              f"blank canonical chip. Re-run download_6in_tiles for this county to retry:")
+        for name, url in failed_files:
+            print(f"    - {name}  <-  {url}")
 
     return {
         "county": county,
@@ -940,5 +953,6 @@ def download_6in_tiles(county: str, max_workers: int = 16, imagery_year: Optiona
         "downloaded": downloaded,
         "resumed": resumed,
         "skipped": skipped,
-        "failed": failed
+        "failed": failed,
+        "failed_files": failed_files,
     }
