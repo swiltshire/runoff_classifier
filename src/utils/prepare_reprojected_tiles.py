@@ -859,7 +859,7 @@ def rescan_and_fix_blank_chips(counties: List[str], max_workers: int = 16) -> Di
 
 CHIP_FILENAME_RE = re.compile(r"^chip_(\d+)_r(-?\d+)_c(-?\d+)\.tif$")
 
-def find_phantom_duplicate_chips(counties: List[str]) -> Dict[str, List[Dict]]:
+def find_phantom_duplicate_chips(counties: List[str], max_workers: int = 16) -> Dict[str, List[Dict]]:
     """
     Scan `counties`' materialized canonical_tiles/*.tif for the multi-CRS-
     group phantom-duplicate bug (see ensure_canonical_mosaic_for_counties():
@@ -881,10 +881,22 @@ def find_phantom_duplicate_chips(counties: List[str]) -> Dict[str, List[Dict]]:
     tiles needed), so it works even for counties whose raw tiles have
     already been archived+pruned.
 
+    The (potentially large) set of full-resolution blank-checks - one per
+    file that's part of a same-cell duplicate group, across every county -
+    is done in parallel (ProcessPoolExecutor, same pattern as
+    rescan_and_fix_blank_chips) with a single shared tqdm progress bar,
+    rather than one blank-check at a time per county.
+
     Returns {county_safe: [{"row", "col", "epsg_code", "filename",
     "local_path"} for every phantom chip found]}.
     """
-    report: Dict[str, List[Dict]] = {}
+    workers = max(1, min(max_workers, os.cpu_count() or 1))
+
+    # pass 1 (cheap - just filename parsing, no raster I/O): find every
+    # county's duplicate (row, col) cells and collect the full set of
+    # candidate files across ALL counties that actually need a blank check.
+    county_dupe_cells: Dict[str, Dict[Tuple[int, int], List[Path]]] = {}
+    candidate_paths: List[Path] = []
     for county in counties:
         county_safe = safe_name(county.strip())
         county_dir = project_root() / "data" / "counties" / county_safe / "canonical_tiles"
@@ -904,15 +916,37 @@ def find_phantom_duplicate_chips(counties: List[str]) -> Dict[str, List[Dict]]:
         if not dupe_cells:
             continue
 
+        county_dupe_cells[county_safe] = dupe_cells
+        for paths in dupe_cells.values():
+            candidate_paths.extend(paths)
+
+    if not candidate_paths:
+        return {}
+
+    # pass 2 (expensive - full-resolution raster reads): blank-check every
+    # candidate file once, in parallel, with one shared progress bar.
+    log(f"Blank-checking {len(candidate_paths)} chip(s) across {len(county_dupe_cells)} "
+        f"county folder(s) with duplicate cells ({workers} parallel workers)...")
+    blank_by_path: Dict[Path, bool] = {}
+    with tqdm(total=len(candidate_paths), unit="chip", desc="blank-checking duplicate chips") as pbar:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            future_to_path = {executor.submit(is_fully_blank, p): p for p in candidate_paths}
+            for fut in as_completed(future_to_path):
+                p = future_to_path[fut]
+                blank_by_path[p] = fut.result()
+                pbar.update(1)
+
+    # pass 3 (cheap): classify each county's dupe cells using the blank-check results.
+    report: Dict[str, List[Dict]] = {}
+    for county_safe, dupe_cells in county_dupe_cells.items():
         phantoms: List[Dict] = []
         all_blank_cells = 0
         multi_real_cells = 0
         for (row, col), paths in dupe_cells.items():
-            blank_flags = {p: is_fully_blank(p) for p in paths}
-            non_blank = [p for p, blank in blank_flags.items() if not blank]
+            non_blank = [p for p in paths if not blank_by_path[p]]
             if len(non_blank) == 1:
                 for p in paths:
-                    if blank_flags[p]:
+                    if blank_by_path[p]:
                         m = CHIP_FILENAME_RE.match(p.name)
                         epsg_num = m.group(1)
                         phantoms.append({
@@ -928,7 +962,7 @@ def find_phantom_duplicate_chips(counties: List[str]) -> Dict[str, List[Dict]]:
                 multi_real_cells += 1
 
         if phantoms or all_blank_cells or multi_real_cells:
-            log(f"{county}: {len(dupe_cells)} canonical cell(s) with >1 epsg-prefixed chip - "
+            log(f"{county_safe}: {len(dupe_cells)} canonical cell(s) with >1 epsg-prefixed chip - "
                 f"{len(phantoms)} confirmed phantom (blank duplicate), "
                 f"{all_blank_cells} all-blank (genuine gap, not a duplicate issue), "
                 f"{multi_real_cells} multiple-real-overlap (legitimate CRS-zone boundary, harmless)")
