@@ -75,21 +75,32 @@ def write_mosaic_vrt(vrt_path: str, tif_paths: list[str]) -> None:
     geot = ET.SubElement(vrt, "GeoTransform")
     geot.text = f"{minx}, {px_w}, 0.0, {maxy}, 0.0, {-px_h}"
 
-    # nodata from the first file (optional)
+    # nodata from the first file, falling back to 0 - the convention used
+    # elsewhere in this codebase for "blank" pixels (see is_fully_blank() in
+    # prepare_reprojected_tiles.py) even when a file has no NODATA tag set
+    # in its own metadata. This value is also used below to make each
+    # source's blank pixels transparent during compositing (ComplexSource),
+    # which matters when two overlapping chips legitimately exist for the
+    # same canonical cell (e.g. a county spanning a native-CRS zone
+    # boundary) - without it, whichever source is listed last would blindly
+    # overwrite the other's real pixels with its own blank ones.
     with rasterio.open(tif_paths[0]) as src0_chk:
-        nodata_val = src0_chk.nodata
+        nodata_val = src0_chk.nodata if src0_chk.nodata is not None else 0
 
     # per-band nodes with correct GDAL dataType
     band_nodes = []
     for b in range(1, band_count + 1):
         gdal_dt = gdal_dtype_of(dtypes0[b - 1])
         band = ET.SubElement(vrt, "VRTRasterBand", attrib={"dataType": gdal_dt, "band": str(b)})
-        if nodata_val is not None:
-            nd = ET.SubElement(band, "NoDataValue")
-            nd.text = str(nodata_val)
+        nd = ET.SubElement(band, "NoDataValue")
+        nd.text = str(nodata_val)
         band_nodes.append(band)
 
-    # add each tif as a SimpleSource for each band (relative paths)
+    # add each tif as a ComplexSource (not SimpleSource) for each band, with
+    # a per-source NODATA so overlapping sources composite correctly -
+    # GDAL treats each source's nodata_val pixels as transparent, letting
+    # an underlying source's real content show through, instead of a
+    # SimpleSource's unconditional overwrite (relative paths).
     vrt_dir = os.path.dirname(os.path.abspath(vrt_path))
     for p in tif_paths:
         t = transforms[p]
@@ -102,7 +113,7 @@ def write_mosaic_vrt(vrt_path: str, tif_paths: list[str]) -> None:
 
         for b in range(band_count):
             band = band_nodes[b]
-            ss = ET.SubElement(band, "SimpleSource")
+            ss = ET.SubElement(band, "ComplexSource")
 
             sf = ET.SubElement(ss, "SourceFilename", attrib={"relativeToVRT": "1"})
             sf.text = rel
@@ -112,6 +123,9 @@ def write_mosaic_vrt(vrt_path: str, tif_paths: list[str]) -> None:
 
             ET.SubElement(ss, "SrcRect", attrib={"xOff": "0", "yOff": "0", "xSize": str(w), "ySize": str(h)})
             ET.SubElement(ss, "DstRect", attrib={"xOff": str(x_off), "yOff": str(y_off), "xSize": str(w), "ySize": str(h)})
+
+            nd_src = ET.SubElement(ss, "NODATA")
+            nd_src.text = str(nodata_val)
 
     # write xml
     ET.ElementTree(vrt).write(vrt_path, encoding="UTF-8", xml_declaration=True)
