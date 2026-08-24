@@ -533,12 +533,24 @@ def _crop_and_cache_chip(job: Dict) -> Dict[str, int]:
         tmp_path = local_path.with_name(local_path.name + f".tmp{os.getpid()}")
         try:
             cmd = [
-                GDAL_TRANSLATE, "-q",
+                GDAL_TRANSLATE,
                 "-projwin", str(minx), str(maxy), str(maxx), str(miny),
                 "-co", "COMPRESS=DEFLATE", "-co", "TILED=YES", "-co", "BIGTIFF=IF_SAFER",
                 str(warped_vrt_path), str(tmp_path),
             ]
-            subprocess.check_call(cmd)
+            # Don't use -q / check_call: on failure we need gdal_translate's
+            # stderr (e.g. "Computed -srcwin falls outside raster extent") to
+            # diagnose *why* - a bare non-zero exit code alone isn't
+            # actionable. Still print stdout/stderr on success too (gdal
+            # rarely writes anything without -q, so this is normally silent).
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"gdal_translate failed for chip {s3_key} (exit {proc.returncode}):\n"
+                    f"  cmd: {' '.join(cmd)}\n"
+                    f"  stderr: {proc.stderr.strip()}\n"
+                    f"  stdout: {proc.stdout.strip()}"
+                )
 
             # Verify the freshly-written file actually reads back cleanly
             # before trusting it - catches truncated/corrupted output from a
