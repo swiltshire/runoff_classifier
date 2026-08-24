@@ -510,14 +510,32 @@ def _crop_and_cache_chip(job: Dict) -> Dict[str, int]:
     force = job["force"]
     counties_needing_this_cell: List[str] = job["counties"]
 
-    stats = {"skipped": 0, "generated": 0, "downloaded": 0}
+    stats = {"skipped": 0, "generated": 0, "downloaded": 0, "retried_blank": 0}
     s3_key = chip_s3_key(epsg_code, row, col)
     local_path = chip_local_cache_path(epsg_code, row, col)
 
-    if not force and s3_exists(S3_BUCKET, s3_key):
+    use_cache = not force and s3_exists(S3_BUCKET, s3_key)
+    if use_cache:
         if not local_path.exists():
             download_from_s3(local_path, S3_BUCKET, s3_key)
             stats["downloaded"] = 1
+
+        # Never trust a cached hit blindly - the chip cache is keyed only by
+        # (epsg, row, col), NEVER by county, and is NOT invalidated by
+        # re-downloading raw tiles or wiping a county's own local/S3 data.
+        # If this exact cell was ever cached blank by a bug that's since been
+        # fixed elsewhere in the pipeline (stale mosaic gap, wrong
+        # needed-cells grouping, truncated write, etc.), it would otherwise
+        # be silently re-served forever. Re-cropping from the CURRENT warped
+        # mosaic is cheap relative to a full run and harmless even if the
+        # cell is a genuine coverage gap (it will just come out blank again
+        # and get re-logged below) - so always re-derive rather than trust a
+        # blank cache hit.
+        if is_fully_blank(local_path):
+            use_cache = False
+            stats["retried_blank"] = 1
+
+    if use_cache:
         stats["skipped"] = 1
     else:
         minx, miny, maxx, maxy = chip_bounds(row, col)
@@ -574,7 +592,8 @@ def _crop_and_cache_chip(job: Dict) -> Dict[str, int]:
         # and retried via rescan_and_fix_blank_chips() once raw coverage
         # might have improved, without blocking/slowing this run.
         if is_fully_blank(local_path):
-            print(f"  \u26a0 WARNING: chip {s3_key} generated fully blank/NoData - caching anyway, "
+            reason = "still blank after re-cropping a stale cached blank" if stats["retried_blank"] else "generated fully blank/NoData"
+            print(f"  \u26a0 WARNING: chip {s3_key} {reason} - caching anyway, "
                   f"logged to {_blank_chip_log_path()} for later rescan")
             _log_blank_chip(epsg_code, row, col, s3_key)
 
@@ -750,7 +769,7 @@ def ensure_canonical_mosaic_for_counties(
     #    that group's raw tiles to S3 and delete them locally before moving
     #    to the next group. This keeps at most one group's raw tiles on
     #    local disk at once instead of the full multi-group total.
-    generated = skipped = downloaded = 0
+    generated = skipped = downloaded = retried_blank = 0
     workers = max(1, min(max_workers, os.cpu_count() or 1))
 
     for epsg_code in sorted(relevant_epsgs):
@@ -785,8 +804,9 @@ def ensure_canonical_mosaic_for_counties(
                     generated += result["generated"]
                     skipped += result["skipped"]
                     downloaded += result["downloaded"]
+                    retried_blank += result["retried_blank"]
                     pbar.update(1)
-                    pbar.set_postfix(gen=generated, skip=skipped, dl=downloaded)
+                    pbar.set_postfix(gen=generated, skip=skipped, dl=downloaded, retried=retried_blank)
 
         # this group's chips are all generated/materialized - its raw tiles
         # are no longer needed locally for this run. Back them up to S3 and
@@ -812,7 +832,8 @@ def ensure_canonical_mosaic_for_counties(
     elapsed = fmt_time(time.time() - start)
     log(
         f"Done: {generated} generated, {skipped} skipped, {downloaded} "
-        f"downloaded from S3, elapsed={elapsed}"
+        f"downloaded from S3, {retried_blank} stale-blank cache hit(s) re-cropped, "
+        f"elapsed={elapsed}"
     )
 
     return result_paths
