@@ -522,13 +522,35 @@ def _crop_and_cache_chip(job: Dict) -> Dict[str, int]:
     else:
         minx, miny, maxx, maxy = chip_bounds(row, col)
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        cmd = [
-            GDAL_TRANSLATE, "-q",
-            "-projwin", str(minx), str(maxy), str(maxx), str(miny),
-            "-co", "COMPRESS=DEFLATE", "-co", "TILED=YES", "-co", "BIGTIFF=IF_SAFER",
-            str(warped_vrt_path), str(local_path),
-        ]
-        subprocess.check_call(cmd)
+        # Write to a temp path in the same directory and atomically rename
+        # into place once gdal_translate has fully succeeded and the result
+        # has been read back cleanly. This guarantees a worker that gets
+        # killed/OOM-killed/interrupted (e.g. during a large parallel
+        # force-rebuild) or hits a disk-full condition mid-write can never
+        # leave a truncated/corrupted GeoTIFF sitting at `local_path` - the
+        # rename is the only thing that can make a bad file appear at the
+        # final path, and os.replace() is atomic on both POSIX and Windows.
+        tmp_path = local_path.with_name(local_path.name + f".tmp{os.getpid()}")
+        try:
+            cmd = [
+                GDAL_TRANSLATE, "-q",
+                "-projwin", str(minx), str(maxy), str(maxx), str(miny),
+                "-co", "COMPRESS=DEFLATE", "-co", "TILED=YES", "-co", "BIGTIFF=IF_SAFER",
+                str(warped_vrt_path), str(tmp_path),
+            ]
+            subprocess.check_call(cmd)
+
+            # Verify the freshly-written file actually reads back cleanly
+            # before trusting it - catches truncated/corrupted output from a
+            # gdal_translate that reported success but wrote a bad file
+            # (e.g. a delayed disk-full error only surfaced at close()).
+            with rasterio.open(tmp_path) as _verify_src:
+                _verify_src.read()
+
+            os.replace(tmp_path, local_path)
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink()
         stats["generated"] = 1
 
         # A freshly-cropped chip that comes out fully blank is suspicious (a
