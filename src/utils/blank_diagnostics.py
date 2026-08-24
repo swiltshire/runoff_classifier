@@ -10,7 +10,8 @@ question), meant to be called from notebook cells or ad-hoc scripts.
 from __future__ import annotations
 
 import os
-from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Optional, Tuple
 
 import numpy as np
 import geopandas as gpd
@@ -178,6 +179,35 @@ def summarize_categories(gdf: gpd.GeoDataFrame, label: str = "features") -> None
     counts = gdf["pixel_category"].value_counts(dropna=False)
     for cat, n in counts.items():
         print(f"  {cat}: {n} ({100.0 * n / total:.1f}%)")
+
+
+def find_corrupted_tiles(tile_paths: List[str], max_workers: int = 16) -> List[Tuple[str, str]]:
+    """Attempt a full-resolution read of every tile in `tile_paths` (in
+    parallel - this is I/O-bound) and return a list of `(tile_path,
+    error_message)` for any that fail to read - e.g. a truncated/corrupted
+    GeoTIFF from an interrupted write (observed after a large parallel
+    force-rebuild: `TIFFReadEncodedTile() failed` / garbage row/col offsets).
+
+    This is a pure read-integrity check - it does NOT classify blank vs real
+    content (see `per_tile_blank_summary` for that, which uses a fast
+    decimated read and would not reliably catch this kind of corruption).
+    """
+    def _check(p: str) -> Optional[Tuple[str, str]]:
+        try:
+            with rasterio.open(p) as src:
+                src.read()
+            return None
+        except Exception as e:
+            return (p, str(e))
+
+    bad: List[Tuple[str, str]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(_check, p) for p in tile_paths]
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result is not None:
+                bad.append(result)
+    return bad
 
 
 def per_tile_blank_summary(tile_paths: List[str], downsample: int = 8) -> gpd.GeoDataFrame:
