@@ -534,6 +534,8 @@ def _crop_and_cache_chip(job: Dict) -> Dict[str, int]:
         try:
             cmd = [
                 GDAL_TRANSLATE,
+                "-of", "GTiff",  # tmp_path's extension isn't ".tif" (pid suffix
+                                 # appended after it), so it can't be auto-detected
                 "-projwin", str(minx), str(maxy), str(maxx), str(miny),
                 "-co", "COMPRESS=DEFLATE", "-co", "TILED=YES", "-co", "BIGTIFF=IF_SAFER",
                 str(warped_vrt_path), str(tmp_path),
