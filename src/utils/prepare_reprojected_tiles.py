@@ -426,7 +426,25 @@ def build_native_vrt(epsg_code: str, tile_paths: List[Path]) -> Path:
     out_vrt = workdir / f"native_{epsg_num}.vrt"
     if out_vrt.exists():
         out_vrt.unlink()
-    subprocess.check_call([GDALBUILDVRT, "-q", "-input_file_list", str(list_file), str(out_vrt)])
+    # -srcnodata/-vrtnodata 0: these raw tiles carry no intrinsic NoDataValue
+    # or mask/alpha band of their own, so without this, gdalbuildvrt's default
+    # overlap compositing ("last listed source wins, full opaque paint") would
+    # let a later-listed tile's 0-valued edge/padding pixels silently
+    # overwrite real imagery from an earlier-listed tile in the same overlap
+    # region - it has no way to know 0 means "no data" here otherwise.
+    # Declaring 0 as nodata lets gdalbuildvrt see through those pixels to
+    # whichever source actually has real data underneath, instead of just
+    # picking whichever tile happens to be listed last (tile order here is
+    # arbitrary directory-listing order, not quality-ranked). 0 is also the
+    # same sentinel value is_fully_blank() already treats as "no imagery"
+    # everywhere else in this module, so this is consistent, not a new
+    # convention - and true all-band (R,G,B,IR all exactly 0) pixels don't
+    # occur in real photographed imagery.
+    subprocess.check_call([
+        GDALBUILDVRT, "-q",
+        "-srcnodata", "0", "-vrtnodata", "0",
+        "-input_file_list", str(list_file), str(out_vrt),
+    ])
     return out_vrt
 
 def build_warped_vrt(native_vrt: Path, epsg_code: str) -> Path:
@@ -440,6 +458,11 @@ def build_warped_vrt(native_vrt: Path, epsg_code: str) -> Path:
         "-t_srs", CANONICAL_CRS,
         "-tr", str(CANONICAL_RES), str(CANONICAL_RES),
         "-tap", "-r", "cubic", "-overwrite",
+        # keep the same 0-as-nodata declaration through the reprojection -
+        # explicit rather than relying on gdalwarp's implicit "inherit
+        # nodata from source" default, so the warped VRT (and every chip
+        # gdal_translate'd from it) reliably carries a real NoDataValue tag.
+        "-srcnodata", "0", "-dstnodata", "0",
         str(native_vrt), str(out_vrt),
     ]
     subprocess.check_call(cmd)
