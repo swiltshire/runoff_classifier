@@ -16,6 +16,7 @@ import numpy as np
 import geopandas as gpd
 import rasterio
 from rasterio.windows import Window, from_bounds
+from rasterio.features import geometry_mask
 from shapely.geometry import box
 
 
@@ -23,8 +24,8 @@ def _read_window_stats(src: rasterio.io.DatasetReader, bounds, min_size_px: int 
     """Read the pixel window under `bounds` (a geometry's bounding box in the
     raster's own CRS), padding tiny windows up to at least `min_size_px` on a
     side so very small point-like features still sample a few pixels. Returns
-    the raw band array (bands, rows, cols), or None if the bounds don't
-    overlap the raster at all.
+    a (band array (bands, rows, cols), window) tuple, or None if the bounds
+    don't overlap the raster at all.
     """
     full = Window(0, 0, src.width, src.height)
     try:
@@ -45,7 +46,7 @@ def _read_window_stats(src: rasterio.io.DatasetReader, bounds, min_size_px: int 
         win = padded.intersection(full)
     if win.width < 1 or win.height < 1:
         return None
-    return src.read(window=win)
+    return src.read(window=win), win
 
 
 def _windows_overlap(a: Window, b: Window) -> bool:
@@ -63,9 +64,12 @@ def classify_geometries_by_raster_content(
     blank_frac_thresh: float = 0.9,
     min_window_px: int = 3,
 ) -> gpd.GeoDataFrame:
-    """For each geometry in `gdf`, sample the underlying pixel window from
+    """For each geometry in `gdf`, sample the underlying pixels from
     `raster_path` and classify it based on the fraction of NoData/zero pixels
-    under the geometry's bounding box:
+    under the geometry's own footprint (rasterized to the pixel grid, NOT
+    just its bounding box - important for irregular/elongated polygons, e.g.
+    Mask R-CNN instance segmentation outputs, where the bounding box can
+    include a lot of area outside the actual detected shape):
       - "real_imagery": pct_blank <= (1 - blank_frac_thresh)
       - "blank_nodata": pct_blank >= blank_frac_thresh
       - "mixed": in between
@@ -77,12 +81,16 @@ def classify_geometries_by_raster_content(
     across all bands (the common case for imagery that was never tagged with
     a real NoData value but is just zero-filled outside real coverage).
 
-    Adds columns: pct_blank, pixel_mean, pixel_std, pixel_category.
+    Adds columns: pct_blank (polygon-footprint-based, used for
+    pixel_category), pct_blank_bbox (the previous bounding-box-based
+    figure, kept for before/after comparison), pixel_mean, pixel_std
+    (both polygon-footprint-based), pixel_category.
     Returns a NEW GeoDataFrame (copy) - does not mutate the input.
     """
     out = gdf.copy().reset_index(drop=True)
 
     pct_blank_col: List[Optional[float]] = []
+    pct_blank_bbox_col: List[Optional[float]] = []
     mean_col: List[Optional[float]] = []
     std_col: List[Optional[float]] = []
     category_col: List[str] = []
@@ -95,14 +103,24 @@ def classify_geometries_by_raster_content(
         for geom in out.geometry:
             if geom is None or geom.is_empty:
                 pct_blank_col.append(None)
+                pct_blank_bbox_col.append(None)
                 mean_col.append(None)
                 std_col.append(None)
                 category_col.append("invalid_geometry")
                 continue
 
-            arr = _read_window_stats(src, geom.bounds, min_size_px=min_window_px)
+            result = _read_window_stats(src, geom.bounds, min_size_px=min_window_px)
+            if result is None:
+                pct_blank_col.append(None)
+                pct_blank_bbox_col.append(None)
+                mean_col.append(None)
+                std_col.append(None)
+                category_col.append("outside_raster")
+                continue
+            arr, win = result
             if arr is None or arr.size == 0:
                 pct_blank_col.append(None)
+                pct_blank_bbox_col.append(None)
                 mean_col.append(None)
                 std_col.append(None)
                 category_col.append("outside_raster")
@@ -113,10 +131,26 @@ def classify_geometries_by_raster_content(
             else:
                 blank_mask = np.all(arr == 0, axis=0)
 
-            pct_blank = float(blank_mask.mean())
+            pct_blank_bbox = float(blank_mask.mean())
+            pct_blank_bbox_col.append(pct_blank_bbox)
+
+            # Restrict to pixels actually inside the geometry's own footprint
+            # (not just its bounding box) - rasterize the geometry onto this
+            # window's pixel grid. Falls back to the full bbox if the
+            # geometry is too thin/small to rasterize to any pixel (rare
+            # edge case, e.g. a sub-pixel sliver).
+            win_transform = src.window_transform(win)
+            footprint_mask = geometry_mask(
+                [geom], out_shape=blank_mask.shape, transform=win_transform, invert=True
+            )
+            if not footprint_mask.any():
+                footprint_mask = np.ones_like(blank_mask, dtype=bool)
+
+            pct_blank = float(blank_mask[footprint_mask].mean())
             pct_blank_col.append(pct_blank)
-            mean_col.append(float(arr.mean()))
-            std_col.append(float(arr.std()))
+            footprint_arr = arr[:, footprint_mask]
+            mean_col.append(float(footprint_arr.mean()))
+            std_col.append(float(footprint_arr.std()))
 
             if pct_blank >= blank_frac_thresh:
                 category_col.append("blank_nodata")
@@ -126,6 +160,7 @@ def classify_geometries_by_raster_content(
                 category_col.append("mixed")
 
     out["pct_blank"] = pct_blank_col
+    out["pct_blank_bbox"] = pct_blank_bbox_col
     out["pixel_mean"] = mean_col
     out["pixel_std"] = std_col
     out["pixel_category"] = category_col
