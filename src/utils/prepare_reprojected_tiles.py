@@ -48,13 +48,26 @@ New architecture:
      gives the rest of the pipeline (training VRT assembly, inference,
      notebook widgets) a familiar per-county folder layout without needing
      to know about the shared cache.
-  6. Once a native-CRS group's chips are fully generated and materialized,
-     that group's raw tiles are no longer needed locally for this run: they
-     are backed up to our own S3 bucket (`RAW_ARCHIVE_S3_PREFIX`), verified,
-     then deleted locally (`archive_and_prune_raw_tiles()`) before moving on
-     to the next group. This means raw tiles and canonical output never
-     both have to be fully resident on local disk at the same time - only
-     one CRS group's raw tiles plus the canonical output generated so far.
+  6. Raw tiles for every requested county are kept resident on local disk
+     for the ENTIRE call - never pruned mid-run - so every native-CRS
+     group's mosaic is always built from its complete, final raw-tile set
+     from the very start. This is what makes border invalidation
+     unnecessary to reason about across separate calls: there is no
+     scenario where a group gets mosaicked from a partial/context-starved
+     subset of its tiles. Instead, local disk is bounded from the OTHER
+     side: as soon as a group's chips are generated and durably uploaded to
+     S3 (inside `_crop_and_cache_chip`), that group's local
+     `canonical_tiles/` copies are deleted immediately (they're safe to
+     lose - already durable in S3). Once every group has been processed,
+     ALL raw tiles used this run are backed up to our own S3 bucket
+     (`RAW_ARCHIVE_S3_PREFIX`), verified, then deleted locally in one
+     deferred pass (`archive_and_prune_raw_tiles()`) - and finally, every
+     requested county's `canonical_tiles/` is repopulated by fetching its
+     chips back from S3 via its manifest
+     (`fetch_county_canonical_chips_from_s3()`). So at any given moment,
+     local disk holds at most: all requested raw tiles, plus one CRS
+     group's canonical chips - never the full multi-group canonical total
+     mid-run, and never raw tiles for only a subset of a group.
 
 Border invalidation: when a genuinely new county is added whose raw tiles
 fall into a CRS group that already has cached chips, any existing chip
@@ -194,6 +207,36 @@ def write_county_manifest(county: str, county_safe: str, cells: List[Tuple[str, 
 def download_from_s3(local_path: Path, bucket: str, key: str):
     local_path.parent.mkdir(parents=True, exist_ok=True)
     s3.download_file(bucket, key, str(local_path))
+
+def fetch_county_canonical_chips_from_s3(county: str, county_safe: str) -> List[Path]:
+    """Download every canonical chip listed in a county's S3 manifest
+    (written by write_county_manifest()) into its local canonical_tiles/
+    folder, skipping any chip already present locally with the right name.
+    Python port of scripts/fetch_canonical.ps1's logic, for use on
+    SageMaker/Linux where the pipeline itself runs. Used internally by
+    ensure_canonical_mosaic_for_counties() to repopulate canonical_tiles/
+    after generation (chips are pruned locally per-group during generation
+    to bound disk usage), and can also be called standalone to restore a
+    county's local chips later without re-running the whole sweep."""
+    manifest_key = county_manifest_s3_key(county_safe)
+    try:
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=manifest_key)
+    except Exception as e:
+        log(f"  ✗ {county}: no manifest found in S3 ({manifest_key}): {e}")
+        return []
+    manifest = json.loads(obj["Body"].read())
+    keys = manifest.get("keys", [])
+
+    county_dir = project_root() / "data" / "counties" / county_safe / "canonical_tiles"
+    county_dir.mkdir(parents=True, exist_ok=True)
+
+    paths: List[Path] = []
+    for key in keys:
+        local_path = county_dir / Path(key).name
+        if not local_path.exists():
+            download_from_s3(local_path, S3_BUCKET, key)
+        paths.append(local_path)
+    return sorted(paths)
 
 # ---------------------------------------------------------------------
 # Raw tile S3 archive (backup-then-delete lifecycle, so raw tiles and
@@ -788,12 +831,19 @@ def ensure_canonical_mosaic_for_counties(
             cell_to_counties[cell].append(county_safe)
 
     # 6. process ONE native-CRS group at a time, end to end: build its
-    #    mosaic, crop+cache+materialize every chip it needs, then archive
-    #    that group's raw tiles to S3 and delete them locally before moving
-    #    to the next group. This keeps at most one group's raw tiles on
-    #    local disk at once instead of the full multi-group total.
+    #    mosaic, crop+cache+materialize every chip it needs. Raw tiles for
+    #    every requested county are already resident on local disk from
+    #    step 1 and stay resident for the whole call (pruning is deferred
+    #    until every group is done - see below), so every group's mosaic is
+    #    always built from its complete, final raw-tile set. To bound local
+    #    disk from the canonical-output side instead, each group's local
+    #    canonical_tiles/ copies are deleted immediately once that group's
+    #    chips are durably uploaded to S3 - canonical_tiles/ is repopulated
+    #    for every requested county via a single S3 fetch pass at the end
+    #    (step 8), so this is safe and invisible to callers.
     generated = skipped = downloaded = retried_blank = 0
     workers = max(1, min(max_workers, os.cpu_count() or 1))
+    processed_groups: List[Tuple[str, List[Path]]] = []
 
     for epsg_code in sorted(relevant_epsgs):
         group_tiles = all_groups.get(epsg_code, [])
@@ -831,26 +881,49 @@ def ensure_canonical_mosaic_for_counties(
                     pbar.update(1)
                     pbar.set_postfix(gen=generated, skip=skipped, dl=downloaded, retried=retried_blank)
 
-        # this group's chips are all generated/materialized - its raw tiles
-        # are no longer needed locally for this run. Back them up to S3 and
-        # free the space before starting the next group.
+        # this group's chips are all generated/materialized and already
+        # durable in S3 (uploaded inside _crop_and_cache_chip). Prune the
+        # local canonical_tiles/ copies for every county this group
+        # affected right away, to bound peak local disk to roughly one
+        # group's canonical footprint at a time - they'll be repopulated
+        # from S3 for every requested county in one pass once the whole
+        # loop finishes (step 8). Raw-tile pruning for this group is
+        # deferred (see after the loop): every requested county's raw
+        # tiles must stay resident until ALL groups are processed, so no
+        # group is ever mosaicked from a partial raw-tile set.
+        affected_counties = {c for job in jobs for c in job["counties"]}
+        epsg_num = epsg_code.split(":")[-1]
+        for county_safe in affected_counties:
+            county_dir = project_root() / "data" / "counties" / county_safe / "canonical_tiles"
+            for stale in county_dir.glob(f"chip_{epsg_num}_*.tif"):
+                stale.unlink()
+
+        processed_groups.append((epsg_code, group_tiles))
+
+    # 6b. every relevant native-CRS group has now been fully processed with
+    #     its complete raw-tile set - archive+prune ALL of this run's raw
+    #     tiles in one deferred pass.
+    for epsg_code, group_tiles in processed_groups:
         archive_and_prune_raw_tiles(group_tiles)
 
-    # 7. result_paths - workers already materialized hardlinks per-chip as
-    #    each group's jobs completed above, so just glob what's there.
-    result_paths: Dict[str, List[Path]] = {}
-    for county_safe in counties_safe:
-        county_dir = project_root() / "data" / "counties" / county_safe / "canonical_tiles"
-        result_paths[county_safe] = sorted(county_dir.glob("*.tif"))
-
-    # 8. write/refresh each requested county's S3 manifest (list of exact
-    #    chip S3 keys it needs) so a collaborator can fetch just that
-    #    county's chips directly, without needing to know the native-CRS
-    #    folder layout or replicate any grid/CRS math locally.
+    # 7. write/refresh each requested county's S3 manifest (list of exact
+    #    chip S3 keys it needs) so a collaborator - or the fetch step right
+    #    below - can pull just that county's chips directly, without
+    #    needing to know the native-CRS folder layout or replicate any
+    #    grid/CRS math locally.
     for county, county_safe in zip(counties, counties_safe):
         cells = county_needed_cells.get(county_safe, [])
         if cells:
             write_county_manifest(county, county_safe, cells)
+
+    # 8. every chip generated this run was pruned from local disk right
+    #    after its native-CRS group finished (step 6), so canonical_tiles/
+    #    is currently empty for every requested county. Repopulate it now
+    #    by fetching each county's chips back from S3 via its manifest.
+    result_paths: Dict[str, List[Path]] = {}
+    for county, county_safe in zip(counties, counties_safe):
+        cells = county_needed_cells.get(county_safe, [])
+        result_paths[county_safe] = fetch_county_canonical_chips_from_s3(county, county_safe) if cells else []
 
     elapsed = fmt_time(time.time() - start)
     log(
