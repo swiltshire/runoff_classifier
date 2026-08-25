@@ -426,13 +426,17 @@ def get_layers(session: requests.Session) -> List[Tuple[int,int,str]]:
     return sorted(out, reverse=True)
 
 def county_where(county: str) -> str:
-    # Strip spaces from both the input and the service's `county` attribute
-    # before matching - some counties (La Porte/LaPorte, De Kalb/DeKalb, La
-    # Grange/LaGrange) are spelled with a space in our CSV/notebooks but
-    # without one (or vice versa) in the ArcGIS service data, and a literal
-    # LIKE match silently returns zero rows in that case.
-    c = re.sub(r"\s+", "", county).replace("'", "''").upper()
-    return f"UPPER(REPLACE(county, ' ', '')) LIKE '%{c}%'"
+    # Some counties (La Porte/LaPorte, De Kalb/DeKalb, La Grange/LaGrange)
+    # are spelled with a space in our CSV/notebooks but without one in the
+    # ArcGIS service's `county` attribute (or vice versa), and a literal
+    # LIKE match against only one spelling silently returns zero rows in
+    # that case. OR together both the as-given and space-stripped variants
+    # (rather than using SQL REPLACE(), which this ArcGIS service's query
+    # engine doesn't support - it silently returns zero features instead of
+    # erroring).
+    variants = {county.strip().replace("'", "''").upper()}
+    variants.add(re.sub(r"\s+", "", county).replace("'", "''").upper())
+    return " OR ".join(f"UPPER(county) LIKE '%{v}%'" for v in variants)
 
 
 def load_training_imagery_years(csv_path: Path) -> Dict[str, int]:
