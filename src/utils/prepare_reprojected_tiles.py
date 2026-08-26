@@ -231,11 +231,16 @@ def fetch_county_canonical_chips_from_s3(county: str, county_safe: str) -> List[
     county_dir.mkdir(parents=True, exist_ok=True)
 
     paths: List[Path] = []
-    for key in keys:
-        local_path = county_dir / Path(key).name
-        if not local_path.exists():
-            download_from_s3(local_path, S3_BUCKET, key)
-        paths.append(local_path)
+    downloaded = 0
+    with tqdm(total=len(keys), unit="chip", desc=f"  fetching {county} from S3") as pbar:
+        for key in keys:
+            local_path = county_dir / Path(key).name
+            if not local_path.exists():
+                download_from_s3(local_path, S3_BUCKET, key)
+                downloaded += 1
+            paths.append(local_path)
+            pbar.update(1)
+    log(f"  {county}: {len(paths)} chip(s) ready ({downloaded} downloaded, {len(paths) - downloaded} already local)")
     return sorted(paths)
 
 # ---------------------------------------------------------------------
@@ -911,6 +916,7 @@ def ensure_canonical_mosaic_for_counties(
     #    below - can pull just that county's chips directly, without
     #    needing to know the native-CRS folder layout or replicate any
     #    grid/CRS math locally.
+    log(f"Writing S3 manifests for {len(counties)} counties...")
     for county, county_safe in zip(counties, counties_safe):
         cells = county_needed_cells.get(county_safe, [])
         if cells:
@@ -920,6 +926,7 @@ def ensure_canonical_mosaic_for_counties(
     #    after its native-CRS group finished (step 6), so canonical_tiles/
     #    is currently empty for every requested county. Repopulate it now
     #    by fetching each county's chips back from S3 via its manifest.
+    log(f"Fetching canonical chips back from S3 for {len(counties)} counties...")
     result_paths: Dict[str, List[Path]] = {}
     for county, county_safe in zip(counties, counties_safe):
         cells = county_needed_cells.get(county_safe, [])
