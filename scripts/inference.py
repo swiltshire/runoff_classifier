@@ -210,6 +210,13 @@ def parse_args():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--mask_path")
     parser.add_argument("--min_cover_frac", type=float, default=0.0)
+    parser.add_argument("--county_mask_path",
+                        help="polygon vector file (e.g. GeoJSON/shapefile) of the county "
+                             "boundary; detections are kept only if at least "
+                             "--county_min_cover_frac of their box lies inside it")
+    parser.add_argument("--county_min_cover_frac", type=float, default=0.5,
+                        help="minimum fraction of a detection box that must fall inside "
+                             "the county boundary (default 0.5 = majority inside)")
     parser.add_argument("--class_area_csv")
     return parser.parse_args()
 
@@ -316,6 +323,36 @@ def main():
                 "[debug] mask filtered windows=%d (from %d)",
                 len(windows_all),
                 total_before,
+            )
+
+    # -----------------------------
+    # county boundary mask (box-level filtering only, applied post-NMS below;
+    # deliberately NOT used for window pre-filtering — windows are cheap to keep
+    # near the boundary, and the majority-inside rule only makes sense per box)
+    # -----------------------------
+    county_mask_raster = None
+    county_mask_meta = None
+
+    if args.county_mask_path:
+        if is_main_process():
+            logger.info("[debug] building county-boundary mask (downsample=%dx)", MASK_DOWNSAMPLE)
+            county_mask_raster, county_mask_meta = get_mask_clipped(
+                raster_path=args.raster_path,
+                mask_path=args.county_mask_path,
+                cache_dir=os.path.dirname(args.raster_path),
+                downsample=MASK_DOWNSAMPLE,
+            )
+
+        if dist.is_initialized():
+            dist.barrier()
+
+        if not is_main_process():
+            county_mask_raster, county_mask_meta = get_mask_clipped(
+                raster_path=args.raster_path,
+                mask_path=args.county_mask_path,
+                cache_dir=os.path.dirname(args.raster_path),
+                downsample=MASK_DOWNSAMPLE,
+                load_only=True,
             )
 
     if is_main_process():
@@ -454,25 +491,25 @@ def main():
     # this is a direct array lookup (no world-coordinate transform, no shapely) - fast and
     # exact at MASK_DOWNSAMPLE=1, since dividing a box's pixel span by 1 never collapses
     # it to a zero-size chip regardless of how small the box is.
-    if args.mask_path and len(boxes) > 0 and mask_raster is not None:
-        min_frac = max(0.0, float(args.min_cover_frac))
+    def _apply_box_mask_filter(boxes, scores, labels, kept_masks_flat,
+                               kept_tile_transforms, mask_arr, meta, min_frac, tag):
         boxes_np = boxes.numpy()
 
         if is_main_process():
-            logger.info("[debug] filtering %d boxes by AOI mask", len(boxes_np))
+            logger.info("[debug] filtering %d boxes by %s mask", len(boxes_np), tag)
 
         keep_mask = filter_boxes_by_mask_raster(
-            mask_raster,
+            mask_arr,
             boxes_np,
             min_cover_frac=min_frac,
-            row0=mask_meta["row0"],
-            col0=mask_meta["col0"],
-            downsample=mask_meta["downsample"],
+            row0=meta["row0"],
+            col0=meta["col0"],
+            downsample=meta["downsample"],
         )
         keep_box = np.nonzero(keep_mask)[0].tolist()
 
         if is_main_process():
-            logger.info("[debug] AOI box filter kept %d of %d", len(keep_box), len(boxes_np))
+            logger.info("[debug] %s box filter kept %d of %d", tag, len(keep_box), len(boxes_np))
 
         if keep_box:
             keep_t = torch.tensor(keep_box, dtype=torch.long)
@@ -485,6 +522,25 @@ def main():
         else:
             boxes = boxes[:0]; scores = scores[:0]; labels = labels[:0]
             kept_masks_flat = []; kept_tile_transforms = []
+        return boxes, scores, labels, kept_masks_flat, kept_tile_transforms
+
+    if args.mask_path and len(boxes) > 0 and mask_raster is not None:
+        boxes, scores, labels, kept_masks_flat, kept_tile_transforms = _apply_box_mask_filter(
+            boxes, scores, labels, kept_masks_flat, kept_tile_transforms,
+            mask_raster, mask_meta,
+            max(0.0, float(args.min_cover_frac)), "AOI",
+        )
+
+    # County-boundary enforcement: same mechanism as the AOI filter above, but with a
+    # majority-inside default (county_min_cover_frac=0.5) — a detection straddling the
+    # county line is kept only by the county containing most of its box, so adjacent
+    # counties' outputs partition straddlers instead of duplicating them.
+    if args.county_mask_path and len(boxes) > 0 and county_mask_raster is not None:
+        boxes, scores, labels, kept_masks_flat, kept_tile_transforms = _apply_box_mask_filter(
+            boxes, scores, labels, kept_masks_flat, kept_tile_transforms,
+            county_mask_raster, county_mask_meta,
+            max(0.0, float(args.county_min_cover_frac)), "county-boundary",
+        )
 
     # vectorize to polygons (per-rank) — still needed to emit polygons, but we keep it lightweight
     if is_main_process():

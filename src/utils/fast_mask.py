@@ -1,6 +1,7 @@
 # src/utils/fast_mask.py
 from __future__ import annotations
 import os
+import glob
 import json
 import time
 import logging
@@ -14,25 +15,41 @@ from rasterio.features import rasterize
 from rasterio.windows import Window
 
 
+def _mask_cache_tag(mask_path: str, downsample: int) -> str:
+    """Cache-filename tag that identifies BOTH the mask source and the downsample
+    factor. The mask identity (basename stem + short hash of the absolute path)
+    must be part of the cache key: multiple different AOI masks (e.g. the NHD
+    waterway mask and a county-boundary mask) can be rasterized against the SAME
+    raster, and a key derived only from the raster basename would silently serve
+    one mask's cached array for the other.
+    """
+    stem = os.path.splitext(os.path.basename(mask_path))[0]
+    stem = "".join(ch if ch.isalnum() else "_" for ch in stem)[:40]
+    digest = hashlib.md5(os.path.abspath(mask_path).encode("utf-8")).hexdigest()[:8]
+    return f"_mask_{stem}_{digest}_ds{downsample}_clipped"
+
+
 def clear_mask_cache(raster_path: str, cache_dir: str, downsample: int = 16):
     """
-    Clear cached AOI mask files for a given raster.
-    Called when VRT is regenerated to prevent spatial misalignment.
+    Clear ALL cached AOI mask files for a given raster (every mask source, every
+    downsample factor). Called when VRT is regenerated to prevent spatial
+    misalignment.
+
+    `downsample` is kept for call-site compatibility but no longer narrows the
+    match: since cache filenames now embed the mask source identity (see
+    _mask_cache_tag), a VRT rebuild must invalidate every mask variant, not just
+    one known name.
     """
     logger = logging.getLogger("mask_raster")
     base = os.path.splitext(os.path.basename(raster_path))[0]
-    tag = f"_mask_ds{downsample}_clipped"
-    mask_path_npy = os.path.join(cache_dir, base + tag + ".npy")
-    meta_path_json = os.path.join(cache_dir, base + tag + ".json")
-    
+    pattern = os.path.join(cache_dir, base + "_mask_*_clipped.*")
+
     cleared = False
-    if os.path.exists(mask_path_npy):
-        os.remove(mask_path_npy)
-        cleared = True
-    if os.path.exists(meta_path_json):
-        os.remove(meta_path_json)
-        cleared = True
-    
+    for p in glob.glob(pattern):
+        if p.endswith(".npy") or p.endswith(".json"):
+            os.remove(p)
+            cleared = True
+
     if cleared:
         logger.info("[mask] cleared cache for %s", base)
 
@@ -55,7 +72,7 @@ def get_mask_clipped(
     os.makedirs(cache_dir, exist_ok=True)
 
     base = os.path.splitext(os.path.basename(raster_path))[0]
-    tag = f"_mask_ds{downsample}_clipped"
+    tag = _mask_cache_tag(mask_path, downsample)
     mask_path_npy = os.path.join(cache_dir, base + tag + ".npy")
     meta_path_json = os.path.join(cache_dir, base + tag + ".json")
 
