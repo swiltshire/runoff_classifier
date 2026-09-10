@@ -208,7 +208,9 @@ def download_from_s3(local_path: Path, bucket: str, key: str):
     local_path.parent.mkdir(parents=True, exist_ok=True)
     s3.download_file(bucket, key, str(local_path))
 
-def fetch_county_canonical_chips_from_s3(county: str, county_safe: str) -> List[Path]:
+def fetch_county_canonical_chips_from_s3(
+    county: str, county_safe: str, *, verify_sizes: bool = False
+) -> List[Path]:
     """Download every canonical chip listed in a county's S3 manifest
     (written by write_county_manifest()) into its local canonical_tiles/
     folder, skipping any chip already present locally with the right name.
@@ -217,7 +219,12 @@ def fetch_county_canonical_chips_from_s3(county: str, county_safe: str) -> List[
     ensure_canonical_mosaic_for_counties() to repopulate canonical_tiles/
     after generation (chips are pruned locally per-group during generation
     to bound disk usage), and can also be called standalone to restore a
-    county's local chips later without re-running the whole sweep."""
+    county's local chips later without re-running the whole sweep.
+
+    With verify_sizes=True, chips already present locally are additionally
+    checked against the S3 object's ContentLength and re-downloaded on
+    mismatch - catching truncated/partial files left by an interrupted
+    earlier download at the cost of one HEAD request per local chip."""
     manifest_key = county_manifest_s3_key(county_safe)
     try:
         obj = s3.get_object(Bucket=S3_BUCKET, Key=manifest_key)
@@ -232,16 +239,37 @@ def fetch_county_canonical_chips_from_s3(county: str, county_safe: str) -> List[
 
     paths: List[Path] = []
     downloaded = 0
+    repaired = 0
     with tqdm(total=len(keys), unit="chip", desc=f"  fetching {county} from S3") as pbar:
         for key in keys:
             local_path = county_dir / Path(key).name
             if not local_path.exists():
                 download_from_s3(local_path, S3_BUCKET, key)
                 downloaded += 1
+            elif verify_sizes:
+                try:
+                    remote_size = s3.head_object(Bucket=S3_BUCKET, Key=key)["ContentLength"]
+                except Exception:
+                    remote_size = None
+                if remote_size is not None and local_path.stat().st_size != remote_size:
+                    download_from_s3(local_path, S3_BUCKET, key)
+                    repaired += 1
             paths.append(local_path)
             pbar.update(1)
-    log(f"  {county}: {len(paths)} chip(s) ready ({downloaded} downloaded, {len(paths) - downloaded} already local)")
+    log(
+        f"  {county}: {len(paths)} chip(s) ready ({downloaded} downloaded, "
+        f"{repaired} repaired, {len(paths) - downloaded - repaired} already local)"
+    )
     return sorted(paths)
+
+def county_has_manifest(county_safe: str) -> bool:
+    """True if a canonical-chip manifest exists in S3 for this county.
+    write_county_manifest() only runs at the very END of a fully successful
+    ensure_canonical_mosaic_for_counties() pass over the county, so manifest
+    presence is a reliable completed-at-least-once marker: every chip it
+    lists was cached to S3 before the manifest was written. Counties whose
+    ensure run was interrupted have no manifest and need the full path."""
+    return s3_exists(S3_BUCKET, county_manifest_s3_key(county_safe))
 
 # ---------------------------------------------------------------------
 # Raw tile S3 archive (backup-then-delete lifecycle, so raw tiles and

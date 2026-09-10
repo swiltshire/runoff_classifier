@@ -40,8 +40,11 @@ for _p in (PROJECT_ROOT, SRC_ROOT):
 from utils.prepare_reprojected_tiles import (  # noqa: E402
     BORDER_BUFFER_CHIPS,
     CHIP_SIZE_PX,
+    county_has_manifest,
     ensure_canonical_mosaic_for_counties,
+    fetch_county_canonical_chips_from_s3,
 )
+from utils.indiana_cogs import safe_name  # noqa: E402
 
 
 def parse_args():
@@ -55,6 +58,11 @@ def parse_args():
     parser.add_argument(
         "--force", action="store_true",
         help="force regeneration of all needed chips, even if already cached",
+    )
+    parser.add_argument(
+        "--full", action="store_true",
+        help="skip the manifest fast path and run the full mosaic pipeline for every "
+             "county, even those with a completion manifest in S3 (implied by --force)",
     )
     parser.add_argument("--max_workers", type=int, default=16)
     parser.add_argument("--chip_size_px", type=int, default=CHIP_SIZE_PX)
@@ -71,13 +79,39 @@ def main():
     print(f"[prepare_canonical_mosaic] starting for {len(counties)} counties: {counties}", flush=True)
     t0 = time.time()
 
-    result = ensure_canonical_mosaic_for_counties(
-        counties=counties,
-        force=args.force,
-        max_workers=args.max_workers,
-        chip_size_px=args.chip_size_px,
-        border_buffer_chips=args.border_buffer_chips,
-    )
+    # Manifest fast path: a county's S3 manifest is only written at the very
+    # END of a fully successful ensure pass, so its presence means every chip
+    # the county needs is already cached in S3. For those counties we can
+    # just fetch the chips per manifest (size-verified) - no raw-tile
+    # restore/download at all, which the full pipeline would otherwise need
+    # merely to recompute the chip list from raw tile footprints. Counties
+    # WITHOUT a manifest (never completed, e.g. an interrupted run) go
+    # through the full pipeline as before.
+    result = {}
+    if args.force or args.full:
+        full_counties = counties
+    else:
+        full_counties = []
+        for county in counties:
+            county_safe = safe_name(county)
+            if county_has_manifest(county_safe):
+                print(f"[prepare_canonical_mosaic] {county}: manifest found - fetching chips from S3 "
+                      f"(no raw tiles needed)", flush=True)
+                result[county_safe] = fetch_county_canonical_chips_from_s3(
+                    county, county_safe, verify_sizes=True
+                )
+            else:
+                print(f"[prepare_canonical_mosaic] {county}: no completion manifest - full pipeline", flush=True)
+                full_counties.append(county)
+
+    if full_counties:
+        result.update(ensure_canonical_mosaic_for_counties(
+            counties=full_counties,
+            force=args.force,
+            max_workers=args.max_workers,
+            chip_size_px=args.chip_size_px,
+            border_buffer_chips=args.border_buffer_chips,
+        ))
 
     elapsed = time.time() - t0
     total_chips = sum(len(v) for v in result.values())
