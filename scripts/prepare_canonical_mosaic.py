@@ -6,8 +6,11 @@ session disconnects / SageMaker Studio forced re-logins killing the kernel.
 
 Usage:
     mkdir -p outputs/logs
-    nohup python scripts/prepare_canonical_mosaic.py --counties "Benton,Boone,Cass" \
+    nohup python -u scripts/prepare_canonical_mosaic.py --counties "Benton,Boone,Cass" \
         > outputs/logs/canonical_mosaic_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+
+    (-u matters: with stdout redirected to a file, Python block-buffers plain
+    print() calls, so the log can appear frozen for long stretches otherwise.)
 
     # tail the live log:
     tail -f outputs/logs/canonical_mosaic_<timestamp>.log

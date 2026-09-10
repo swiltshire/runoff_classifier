@@ -265,7 +265,10 @@ def restore_raw_tiles_from_archive(county_safe: str) -> int:
     dest_dir = project_root() / "data" / "counties" / county_safe / "tiles"
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    restored = 0
+    # list first (cheap), then download with a progress bar - this phase can
+    # move GBs per county and used to emit NOTHING until it finished, making
+    # a healthy run look hung for many minutes.
+    archived: List[Tuple[str, str, int]] = []
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []):
@@ -273,11 +276,19 @@ def restore_raw_tiles_from_archive(county_safe: str) -> int:
             filename = key[len(prefix):]
             if not filename or "/" in filename:
                 continue
+            archived.append((key, filename, obj["Size"]))
+
+    if not archived:
+        return 0
+
+    restored = 0
+    with tqdm(total=len(archived), unit="tile", desc=f"  restoring {county_safe} raw tiles from S3") as pbar:
+        for key, filename, size in archived:
             local_path = dest_dir / filename
-            if local_path.exists() and local_path.stat().st_size == obj["Size"]:
-                continue
-            s3.download_file(S3_BUCKET, key, str(local_path))
-            restored += 1
+            if not (local_path.exists() and local_path.stat().st_size == size):
+                s3.download_file(S3_BUCKET, key, str(local_path))
+                restored += 1
+            pbar.update(1)
     return restored
 
 def archive_and_prune_raw_tiles(tile_paths: List[Path]) -> None:
