@@ -187,13 +187,31 @@ def run_inference(county: str, nproc: int) -> Path:
 
 
 def cleanup_county_chips(county: str) -> None:
-    """Delete a county's local canonical chips AFTER successful inference -
-    only if its S3 manifest exists (i.e. the chips are durably restorable)."""
+    """Reclaim a county's local disk after inference.
+
+    - Mask-cache artifacts ({County}_mosaic.vrt + *_mosaic_mask_*.npy/.json)
+      are pure derived caches written by inference.py into the county dir at
+      full mosaic resolution (~40-80 GB *per mask*, and there are two per
+      county: NHD + county boundary). Nothing else ever deletes them, so an
+      unattended statewide run silently accumulates terabytes. Always delete.
+    - canonical_tiles chips are deleted only if the county's S3 manifest
+      exists (i.e. they are durably restorable).
+    """
     county_safe = safe_name(county)
+    county_dir = PROJECT_ROOT / "data" / "counties" / county_safe
+
+    freed = 0
+    for f in list(county_dir.glob("*_mosaic_mask_*")) + list(county_dir.glob("*_mosaic.vrt")):
+        if f.is_file():
+            freed += f.stat().st_size
+            f.unlink()
+    if freed:
+        log(f"{county}: mask-cache artifacts deleted ({freed / 1e9:.0f} GB reclaimed)")
+
     if not county_has_manifest(county_safe):
         log(f"{county}: ⚠ no S3 manifest - keeping local canonical_tiles as the only copy")
         return
-    chip_dir = PROJECT_ROOT / "data" / "counties" / county_safe / "canonical_tiles"
+    chip_dir = county_dir / "canonical_tiles"
     if chip_dir.is_dir():
         shutil.rmtree(chip_dir)
         log(f"{county}: local canonical_tiles deleted (restorable from S3 manifest)")
