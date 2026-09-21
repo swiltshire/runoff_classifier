@@ -180,6 +180,15 @@ def get_mask_clipped(
     with open(meta_path_json, "w") as f:
         json.dump(meta, f)
 
+    # Return a read-only mmap view instead of the fully-materialized array.
+    # At downsample=1 a large county's mask is a 60-80 GB uint8 array; the
+    # building rank (rank 0 under torchrun) used to hold BOTH masks (NHD +
+    # county boundary) fully resident for the whole inference run while the
+    # other ranks mmap'd the cache - which OOM-SIGKILLed rank 0 on the
+    # largest counties. Downstream slicing works identically on a memmap.
+    del mask
+    mask = np.load(mask_path_npy, mmap_mode="r")
+
     logger.info(
         "[mask] cached AOI mask → %s (total time %.2fs)",
         mask_path_npy, time.time() - t_start
