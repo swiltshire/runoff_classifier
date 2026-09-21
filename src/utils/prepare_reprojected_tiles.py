@@ -746,6 +746,7 @@ def ensure_canonical_mosaic_for_counties(
     max_workers: int = 16,
     chip_size_px: int = CHIP_SIZE_PX,
     border_buffer_chips: float = BORDER_BUFFER_CHIPS,
+    max_failed_raw_downloads: int = 20,
 ) -> Dict[str, List[Path]]:
     """
     Ensure canonical (seamlessly reprojected) imagery chips exist for
@@ -809,6 +810,21 @@ def ensure_canonical_mosaic_for_counties(
             log(f"  ✗ {county}: failed to download raw tiles: {e}")
             raise
 
+        if download_result.get("failed", 0) > max_failed_raw_downloads:
+            # A handful of failures can be a genuine upstream gap (the blank-chip
+            # rescan machinery repairs those), but MASS failure means something is
+            # systemically wrong (disk full, upstream outage, throttling). Building
+            # a mosaic from a badly incomplete tile set would (a) compute an
+            # undersized needed-cells list from partial footprints and (b) cache
+            # potentially hundreds of blank chips to S3 under this county's cells
+            # FOREVER. Abort resumably instead - re-running repairs the download
+            # (existing valid tiles are skipped) and continues.
+            raise RuntimeError(
+                f"{county}: {download_result['failed']} raw tile download(s) failed "
+                f"(> max_failed_raw_downloads={max_failed_raw_downloads}) - aborting before "
+                f"building a gappy mosaic that would poison the S3 chip cache with blanks. "
+                f"Likely cause: disk full or upstream outage. Fix and re-run to resume."
+            )
         if download_result.get("failed", 0) > 0:
             log(
                 f"  ⚠ WARNING: {county}: {download_result['failed']} raw tile download(s) failed "

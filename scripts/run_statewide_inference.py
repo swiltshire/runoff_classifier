@@ -214,8 +214,10 @@ def parse_args():
         help="counties per chip-prep batch; bounds peak local disk (default 4)",
     )
     parser.add_argument(
-        "--min_free_gb", type=float, default=400.0,
-        help="abort (resumably) before a batch if free disk is below this (default 400)",
+        "--min_free_gb", type=float, default=1200.0,
+        help="abort (resumably) before a batch if free disk is below this. A 4-county "
+             "full-pipeline batch can peak well past 1 TB (raw tiles + mosaic chips), "
+             "so keep this generous (default 1200)",
     )
     parser.add_argument("--nproc_per_node", type=int, default=4)
     parser.add_argument("--max_workers", type=int, default=16)
@@ -270,9 +272,17 @@ def main():
                 run_inference(county, nproc=args.nproc_per_node)
             except Exception as e:
                 # keep going - one county's failure shouldn't waste the rest of
-                # an unattended overnight run. Its chips are kept for a retry.
-                log(f"✗ {county} FAILED: {e}")
+                # an unattended overnight run.
+                log(f"\u2717 {county} FAILED: {e}")
                 failures.append(county)
+                # Still reclaim the county's local chips if they're durably
+                # restorable from S3 - otherwise a string of failures (e.g. a
+                # persistent GPU issue) silently accumulates hundreds of GB of
+                # kept chips and turns into a disk-full cascade for the
+                # remaining batches. The retry re-fetches via the manifest
+                # fast path in minutes.
+                if not args.keep_chips:
+                    cleanup_county_chips(county)
                 continue
             if not args.keep_chips:
                 cleanup_county_chips(county)
