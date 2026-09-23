@@ -40,6 +40,7 @@ for _p in (PROJECT_ROOT, SRC_ROOT):
 from utils.prepare_reprojected_tiles import (  # noqa: E402
     BORDER_BUFFER_CHIPS,
     CHIP_SIZE_PX,
+    ManifestChipsMissingError,
     county_has_manifest,
     ensure_canonical_mosaic_for_counties,
     fetch_county_canonical_chips_from_s3,
@@ -97,9 +98,14 @@ def main():
             if county_has_manifest(county_safe):
                 print(f"[prepare_canonical_mosaic] {county}: manifest found - fetching chips from S3 "
                       f"(no raw tiles needed)", flush=True)
-                result[county_safe] = fetch_county_canonical_chips_from_s3(
-                    county, county_safe, verify_sizes=True
-                )
+                try:
+                    result[county_safe] = fetch_county_canonical_chips_from_s3(
+                        county, county_safe, verify_sizes=True
+                    )
+                except ManifestChipsMissingError as e:
+                    print(f"[prepare_canonical_mosaic] {county}: stale manifest "
+                          f"({len(e.missing_keys)} chip(s) gone from S3) - full pipeline", flush=True)
+                    full_counties.append(county)
             else:
                 print(f"[prepare_canonical_mosaic] {county}: no completion manifest - full pipeline", flush=True)
                 full_counties.append(county)

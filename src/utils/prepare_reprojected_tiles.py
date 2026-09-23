@@ -95,6 +95,7 @@ from typing import Dict, List, Set, Tuple
 import boto3
 import numpy as np
 import rasterio
+from botocore.exceptions import ClientError
 from rasterio.warp import transform_bounds
 from tqdm import tqdm
 
@@ -208,6 +209,25 @@ def download_from_s3(local_path: Path, bucket: str, key: str):
     local_path.parent.mkdir(parents=True, exist_ok=True)
     s3.download_file(bucket, key, str(local_path))
 
+class ManifestChipsMissingError(RuntimeError):
+    """A county's S3 manifest lists chips that no longer exist in S3 (e.g.
+    deleted by phantom/orphan chip cleanup after the manifest was written).
+    Callers should fall back to the full ensure pipeline for the county,
+    which regenerates missing chips and rewrites a consistent manifest."""
+
+    def __init__(self, county: str, missing_keys: List[str]):
+        self.county = county
+        self.missing_keys = missing_keys
+        super().__init__(
+            f"{county}: {len(missing_keys)} manifest-listed chip(s) missing from S3 "
+            f"(first: {missing_keys[0]})"
+        )
+
+def _is_s3_404(e: Exception) -> bool:
+    return isinstance(e, ClientError) and e.response.get("Error", {}).get("Code") in (
+        "404", "NoSuchKey", "NotFound",
+    )
+
 def fetch_county_canonical_chips_from_s3(
     county: str, county_safe: str, *, verify_sizes: bool = False
 ) -> List[Path]:
@@ -240,22 +260,43 @@ def fetch_county_canonical_chips_from_s3(
     paths: List[Path] = []
     downloaded = 0
     repaired = 0
+    missing: List[str] = []
     with tqdm(total=len(keys), unit="chip", desc=f"  fetching {county} from S3") as pbar:
         for key in keys:
             local_path = county_dir / Path(key).name
             if not local_path.exists():
-                download_from_s3(local_path, S3_BUCKET, key)
-                downloaded += 1
+                try:
+                    download_from_s3(local_path, S3_BUCKET, key)
+                    downloaded += 1
+                except Exception as e:
+                    if not _is_s3_404(e):
+                        raise
+                    missing.append(key)
+                    pbar.update(1)
+                    continue
             elif verify_sizes:
                 try:
                     remote_size = s3.head_object(Bucket=S3_BUCKET, Key=key)["ContentLength"]
-                except Exception:
+                except Exception as e:
+                    if _is_s3_404(e):
+                        # object deleted from S3 after the manifest was written -
+                        # the local copy may be equally stale, treat as missing
+                        missing.append(key)
+                        pbar.update(1)
+                        continue
                     remote_size = None
                 if remote_size is not None and local_path.stat().st_size != remote_size:
                     download_from_s3(local_path, S3_BUCKET, key)
                     repaired += 1
             paths.append(local_path)
             pbar.update(1)
+    if missing:
+        log(
+            f"  \u26a0 {county}: {len(missing)} of {len(keys)} manifest-listed chip(s) "
+            f"missing from S3 (e.g. {missing[0]}) - manifest is stale, county needs "
+            f"the full ensure pipeline to regenerate them and rewrite the manifest"
+        )
+        raise ManifestChipsMissingError(county, missing)
     log(
         f"  {county}: {len(paths)} chip(s) ready ({downloaded} downloaded, "
         f"{repaired} repaired, {len(paths) - downloaded - repaired} already local)"

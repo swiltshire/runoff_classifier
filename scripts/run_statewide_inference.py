@@ -57,6 +57,7 @@ for _p in (str(PROJECT_ROOT), str(SRC_ROOT)):
 from utils.county_boundaries import get_county_boundary_path  # noqa: E402
 from utils.indiana_cogs import safe_name  # noqa: E402
 from utils.prepare_reprojected_tiles import (  # noqa: E402
+    ManifestChipsMissingError,
     county_has_manifest,
     ensure_canonical_mosaic_for_counties,
     fetch_county_canonical_chips_from_s3,
@@ -124,7 +125,12 @@ def ensure_chips_for_batch(batch: list[str], max_workers: int) -> None:
         county_safe = safe_name(county)
         if county_has_manifest(county_safe):
             log(f"{county}: manifest found - fetching chips from S3 (no raw tiles needed)")
-            fetch_county_canonical_chips_from_s3(county, county_safe, verify_sizes=True)
+            try:
+                fetch_county_canonical_chips_from_s3(county, county_safe, verify_sizes=True)
+            except ManifestChipsMissingError as e:
+                log(f"{county}: stale manifest ({len(e.missing_keys)} chip(s) gone from S3) "
+                    f"- falling back to full chip pipeline")
+                full_counties.append(county)
         else:
             full_counties.append(county)
     if full_counties:
