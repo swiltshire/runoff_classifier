@@ -430,13 +430,19 @@ def county_where(county: str) -> str:
     # are spelled with a space in our CSV/notebooks but without one in the
     # ArcGIS service's `county` attribute (or vice versa), and a literal
     # LIKE match against only one spelling silently returns zero rows in
-    # that case. OR together both the as-given and space-stripped variants
-    # (rather than using SQL REPLACE(), which this ArcGIS service's query
-    # engine doesn't support - it silently returns zero features instead of
-    # erroring).
-    variants = {county.strip().replace("'", "''").upper()}
-    variants.add(re.sub(r"\s+", "", county).replace("'", "''").upper())
-    return " OR ".join(f"UPPER(county) LIKE '%{v}%'" for v in variants)
+    # that case. Same for punctuation: we spell "St. Joseph" with a period
+    # but the service stores "St Joseph" (confirmed via a distinct-values
+    # query). OR together the as-given, space-stripped, period-stripped, and
+    # period+space-stripped variants (rather than using SQL REPLACE(), which
+    # this ArcGIS service's query engine doesn't support - it silently
+    # returns zero features instead of erroring).
+    names = {county.strip(), county.strip().replace(".", "").strip()}
+    variants = set()
+    for name in names:
+        name = re.sub(r"\s+", " ", name)
+        variants.add(name.replace("'", "''").upper())
+        variants.add(re.sub(r"\s+", "", name).replace("'", "''").upper())
+    return " OR ".join(f"UPPER(county) LIKE '%{v}%'" for v in sorted(variants))
 
 
 def load_training_imagery_years(csv_path: Path) -> Dict[str, int]:
