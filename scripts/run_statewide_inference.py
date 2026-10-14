@@ -83,7 +83,7 @@ ALL_INDIANA_COUNTIES = sorted([
 # Keep in sync with the notebook's inference config cell.
 TRAIN_OUT_DIR = PROJECT_ROOT / "outputs" / "train_multicounty"
 MODEL_PATH = TRAIN_OUT_DIR / "model_final.pth"
-NHD_MASK_PATH = PROJECT_ROOT / "data" / "NHDmask_Indiana" / "NHDfinalMaskIndiana.shp"
+NHD_MASK_PATH = PROJECT_ROOT / "data" / "nhd_masks" / "IN" / "nhd_mask_in.shp"
 CLASS_AREA_CSV = PROJECT_ROOT / "data" / "feature_size_threshholds.csv"
 INFER_CONFIG = {
     "task": "instance_seg",

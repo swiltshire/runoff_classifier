@@ -65,7 +65,7 @@ runoff_classifier/
 │   │   ├── *.shp                        # Training labels
 │   │   ├── tiles/                       # Raw native-CRS tiles (transient; archived to S3)
 │   │   └── canonical_tiles/             # Canonical chips (used for training/inference)
-│   ├── NHDmask_Indiana/                 # NHD waterway AOI mask
+│   ├── nhd_masks/IN/nhd_mask_in.*       # NHD waterway AOI mask (synced from s3://.../nhd_masks/IN/)
 │   ├── feature_size_threshholds.csv     # Per-class area thresholds
 │   ├── training_county_imagery_years.csv
 │   ├── multi_county_labels.gpkg         # Merged training labels (generated)
@@ -177,7 +177,7 @@ python -m torch.distributed.run --nproc_per_node=4 scripts/inference.py \
     --out_vector outputs/train_multicounty/inferences_Benton/detections_Benton_<timestamp>.gpkg \
     --tile_size 512 --stride 256 --infer_batch 5 --score_thresh 0.75 --normalize imagenet \
     --nms_iou_thresh 0.3 --final_box_iou 0.3 \
-    --mask_path data/NHDmask_Indiana/NHDfinalMaskIndiana.shp --min_cover_frac 0.01 \
+    --mask_path data/nhd_masks/IN/nhd_mask_in.shp --min_cover_frac 0.01 \
     --county_mask_path <county boundary geojson> --county_min_cover_frac 0.5 \
     --class_area_csv data/feature_size_threshholds.csv
 ```
