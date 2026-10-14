@@ -7,7 +7,6 @@ import math
 
 import numpy as np
 from torch.utils.data import Sampler
-import torch
 import torch.distributed as dist
 import geopandas as gpd
 from collections import defaultdict

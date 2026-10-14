@@ -592,7 +592,6 @@ def main():
 
     # rank 0: merge, enforce mask via raster (fast), final box-nms dedupe, area filter, write final
     if is_main_process():
-        import pandas as pd
         parts = [os.path.join(out_dir, f"{base}_rank{r}{ext if ext.lower()=='.gpkg' else '.gpkg'}") for r in range(world_size)]
         logger.info("[debug] looking for rank files in: %s", out_dir)
         logger.info("[debug] rank file paths: %s", parts)

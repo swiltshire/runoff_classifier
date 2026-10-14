@@ -4,7 +4,6 @@ from typing import Optional, Union
 
 import geopandas as gpd
 import rasterio
-from shapely.geometry.base import BaseGeometry
 
 PathLike = Union[str, Path]
 

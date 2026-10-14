@@ -4,21 +4,12 @@ import numpy as np
 import rasterio
 from rasterio.windows import Window
 from rasterio import features as rio_features
-from affine import Affine
 import geopandas as gpd
 from shapely.geometry import box
 import torch
 from torch.utils.data import Dataset
 from torchvision import transforms
 from rasterio.transform import rowcol
-
-def world_to_pixel(x: float, y: float, transform: Affine) -> Tuple[float, float]:
-    inv = ~transform
-    col, row = inv * (x, y)
-    return col, row
-
-def clamp(val: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, val))
 
 class ObjectDetectionTilesDataset(Dataset):
     """

@@ -104,13 +104,12 @@ def log(msg: str) -> None:
 
 
 def county_is_done(county: str) -> bool:
-    """A county is done when a final MERGED detections gpkg exists (per-rank
-    partials `..._rankN.gpkg` and diagnostic exports don't count)."""
+    """A county is done when a final MERGED detections gpkg
+    (`detections_{county}_{YYYYmmdd_HHMMSS}.gpkg`) exists; per-rank partials
+    (`..._rankN.gpkg`) don't count."""
+    final_re = re.compile(rf"detections_{re.escape(county)}_\d{{8}}_\d{{6}}\.gpkg")
     pattern = str(TRAIN_OUT_DIR / f"inferences_{county}" / f"detections_{county}_*.gpkg")
-    for p in glob.glob(pattern):
-        if not re.search(r"_rank\d+", p) and not p.endswith("_pixel_diag.gpkg"):
-            return True
-    return False
+    return any(final_re.fullmatch(os.path.basename(p)) for p in glob.glob(pattern))
 
 
 def free_gb(path: Path) -> float:

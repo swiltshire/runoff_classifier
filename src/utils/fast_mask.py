@@ -6,12 +6,11 @@ import json
 import time
 import logging
 import hashlib
-from typing import Optional, List
+from typing import List
 import numpy as np
 import geopandas as gpd
 import rasterio
 from rasterio import features as rio_features
-from rasterio.features import rasterize
 from rasterio.windows import Window
 
 

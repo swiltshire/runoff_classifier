@@ -82,13 +82,11 @@ newly-added counties.
 import json
 import math
 import os
-import re
 import shutil
 import subprocess
 import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Set, Tuple
 
@@ -210,8 +208,7 @@ def download_from_s3(local_path: Path, bucket: str, key: str):
     s3.download_file(bucket, key, str(local_path))
 
 class ManifestChipsMissingError(RuntimeError):
-    """A county's S3 manifest lists chips that no longer exist in S3 (e.g.
-    deleted by phantom/orphan chip cleanup after the manifest was written).
+    """A county's S3 manifest lists chips that no longer exist in S3.
     Callers should fall back to the full ensure pipeline for the county,
     which regenerates missing chips and rewrites a consistent manifest."""
 
@@ -480,18 +477,6 @@ def _tap_align(minx: float, miny: float, maxx: float, maxy: float, res: float) -
     by = math.ceil(maxy / res) * res
     return ax, ay, bx, by
 
-def _raster_bounds_native(tiles: List[Path]) -> Tuple[float, float, float, float]:
-    minx = miny = float("inf")
-    maxx = maxy = float("-inf")
-    for p in tiles:
-        with rasterio.open(p) as ds:
-            b = ds.bounds
-            minx = min(minx, b.left)
-            miny = min(miny, b.bottom)
-            maxx = max(maxx, b.right)
-            maxy = max(maxy, b.top)
-    return minx, miny, maxx, maxy
-
 def _bounds_to_canonical(
     bounds: Tuple[float, float, float, float], src_epsg: str, buffer_chips: float = 0.0
 ) -> Tuple[float, float, float, float]:
@@ -515,14 +500,13 @@ def _needed_cells_for_tiles(tiles: List[Path], epsg_code: str, buffer_chips: flo
     """Canonical grid cells actually covered by `tiles` - the UNION of each
     tile's own footprint, NOT the group's overall bounding rectangle.
 
-    Using a single overall bbox (via _raster_bounds_native) is wrong whenever
-    a native-CRS group's tiles are sparse/scattered relative to their own
-    bounding rectangle: the bbox can span area that a DIFFERENT native-CRS
-    group's tiles actually cover, causing this group to also claim (and
-    generate a genuinely-blank chip for) a canonical cell that's really
-    covered by the other group. Computing per-tile means each group only
-    ever claims cells its own tiles actually touch. Same per-tile file-header
-    I/O cost as _raster_bounds_native (which already opens every tile)."""
+    Using a single overall bbox is wrong whenever a native-CRS group's tiles
+    are sparse/scattered relative to their own bounding rectangle: the bbox
+    can span area that a DIFFERENT native-CRS group's tiles actually cover,
+    causing this group to also claim (and generate a genuinely-blank chip
+    for) a canonical cell that's really covered by the other group.
+    Computing per-tile means each group only ever claims cells its own tiles
+    actually touch."""
     cells: Set[Tuple[int, int]] = set()
     for p in tiles:
         with rasterio.open(p) as ds:
@@ -597,56 +581,24 @@ def build_warped_vrt(native_vrt: Path, epsg_code: str) -> Path:
     return out_vrt
 
 # ---------------------------------------------------------------------
-# Blank-chip detection + logging
+# Blank-chip detection
 #
 # The chip cache is keyed only by (epsg, row, col) and reused indefinitely
-# (see module docstring). If a raw tile silently fails to download (see
-# indiana_cogs.download_6in_tiles's failed-download warning above) or a
-# CRS group's native mosaic otherwise has a transient gap, the chip cropped
-# from that gap is all-NoData and gets cached in S3 forever - nothing else
-# in the pipeline ever revisits it. These helpers make that condition
-# visible at generation time and queryable later via
-# `rescan_and_fix_blank_chips()`.
+# (see module docstring). If a raw tile fails to download or a CRS group's
+# native mosaic otherwise has a transient gap, the chip cropped from that
+# gap is all-NoData. Cache hits are therefore re-checked for blankness and
+# re-cropped from the current mosaic rather than trusted blindly.
 # ---------------------------------------------------------------------
-
-BLANK_CHIP_LOG_PATH = None  # set lazily via _blank_chip_log_path()
-
-
-def _blank_chip_log_path() -> Path:
-    p = project_root() / "outputs" / "blank_chip_log.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    return p
-
 
 def is_fully_blank(path: Path) -> bool:
     """True if every pixel in `path` is NoData (or exactly zero, when no
-    NoData value is set) across all bands. Public - also used directly by
-    notebook diagnostics (e.g. the "Validate inference imagery" cell) to
-    flag 100%-blank canonical tiles."""
+    NoData value is set) across all bands."""
     with rasterio.open(path) as src:
         arr = src.read()
         nodata_val = src.nodata
         if nodata_val is not None:
             return bool(np.all(arr == nodata_val))
         return bool(np.all(arr == 0))
-
-
-def _log_blank_chip(epsg_code: str, row: int, col: int, s3_key: str) -> None:
-    log_path = _blank_chip_log_path()
-    entries = []
-    if log_path.exists():
-        try:
-            entries = json.loads(log_path.read_text())
-        except (json.JSONDecodeError, OSError):
-            entries = []
-    entries.append({
-        "epsg": epsg_code,
-        "row": row,
-        "col": col,
-        "s3_key": s3_key,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    })
-    log_path.write_text(json.dumps(entries, indent=2))
 
 # ---------------------------------------------------------------------
 # Per-chip crop worker (top-level function so it is picklable for
@@ -737,16 +689,12 @@ def _crop_and_cache_chip(job: Dict) -> Dict[str, int]:
         stats["generated"] = 1
 
         # A freshly-cropped chip that comes out fully blank is suspicious (a
-        # gap in the native mosaic - e.g. from a silently-failed raw tile
-        # download) rather than expected, and will otherwise get cached in
-        # S3 forever with no way to tell later. Log it so it can be found
-        # and retried via rescan_and_fix_blank_chips() once raw coverage
-        # might have improved, without blocking/slowing this run.
+        # gap in the native mosaic - e.g. from a failed raw tile download)
+        # rather than expected. Warn without blocking this run; blank cache
+        # hits are re-cropped automatically on the next run.
         if is_fully_blank(local_path):
             reason = "still blank after re-cropping a stale cached blank" if stats["retried_blank"] else "generated fully blank/NoData"
-            print(f"  \u26a0 WARNING: chip {s3_key} {reason} - caching anyway, "
-                  f"logged to {_blank_chip_log_path()} for later rescan")
-            _log_blank_chip(epsg_code, row, col, s3_key)
+            print(f"  \u26a0 WARNING: chip {s3_key} {reason} - caching anyway")
 
         upload_to_s3(local_path, S3_BUCKET, s3_key)
 
@@ -852,13 +800,13 @@ def ensure_canonical_mosaic_for_counties(
             raise
 
         if download_result.get("failed", 0) > max_failed_raw_downloads:
-            # A handful of failures can be a genuine upstream gap (the blank-chip
-            # rescan machinery repairs those), but MASS failure means something is
-            # systemically wrong (disk full, upstream outage, throttling). Building
+            # A handful of failures can be a genuine upstream gap, but MASS
+            # failure means something is systemically wrong (disk full,
+            # upstream outage, throttling). Building
             # a mosaic from a badly incomplete tile set would (a) compute an
             # undersized needed-cells list from partial footprints and (b) cache
-            # potentially hundreds of blank chips to S3 under this county's cells
-            # FOREVER. Abort resumably instead - re-running repairs the download
+            # potentially hundreds of blank chips to S3 under this county's cells.
+            # Abort resumably instead - re-running repairs the download
             # (existing valid tiles are skipped) and continues.
             raise RuntimeError(
                 f"{county}: {download_result['failed']} raw tile download(s) failed "
@@ -871,8 +819,8 @@ def ensure_canonical_mosaic_for_counties(
                 f"  ⚠ WARNING: {county}: {download_result['failed']} raw tile download(s) failed "
                 f"({download_result['year']} imagery) - the native mosaic for this area will have a "
                 f"gap where those tiles would have been, and any canonical chip cropped from that gap "
-                f"will be cached as blank/NoData. Re-run this county's download (or "
-                f"rescan_and_fix_blank_chips([...]) afterward) to repair it."
+                f"will be blank/NoData. Re-run this county through "
+                f"ensure_canonical_mosaic_for_counties() to retry the download and re-crop blank chips."
             )
 
     # 2. group ALL locally-available raw tiles (every county ever
@@ -1036,249 +984,3 @@ def ensure_canonical_mosaic_for_counties(
     )
 
     return result_paths
-
-
-# ---------------------------------------------------------------------
-# Blank-chip rescan/repair utility
-# ---------------------------------------------------------------------
-
-def rescan_and_fix_blank_chips(counties: List[str], max_workers: int = 16) -> Dict[str, Dict[str, List[str]]]:
-    """
-    Scan `counties`' currently-materialized canonical_tiles/*.tif for chips
-    that are fully blank/NoData at full resolution, and - if any are found
-    for a county - force a full regeneration of that county's chips
-    (`ensure_canonical_mosaic_for_counties(counties=[county], force=True)`),
-    bypassing the stale S3 cache so each chip is re-cropped from the
-    CURRENT native raw-tile mosaic. Re-checks afterward and reports which
-    previously-blank chips came back with real content vs. are still blank
-    (the latter likely reflects a genuine source-imagery gap rather than a
-    pipeline caching issue).
-
-    This is the recommended remediation for chips that were cached blank
-    due to a since-resolved gap in raw tile coverage (e.g. a transient
-    download failure - see the loud warning now emitted by
-    `download_6in_tiles()`/`ensure_canonical_mosaic_for_counties()`).
-
-    Returns {county_safe: {"fixed": [chip names], "still_blank": [chip names]}}.
-    """
-    summary: Dict[str, Dict[str, List[str]]] = {}
-    workers = max(1, min(max_workers, os.cpu_count() or 1))
-
-    for county in counties:
-        county_safe = safe_name(county.strip())
-        county_dir = project_root() / "data" / "counties" / county_safe / "canonical_tiles"
-        tile_paths = sorted(county_dir.glob("*.tif"))
-        if not tile_paths:
-            log(f"{county}: no canonical tiles found at {county_dir} - skipping")
-            continue
-
-        log(f"{county}: scanning {len(tile_paths)} chip(s) at full resolution for blank/NoData content "
-            f"({workers} parallel workers - each chip is a full read, so this can take a while for a "
-            f"large county)...")
-        blank_before = []
-        with tqdm(total=len(tile_paths), unit="chip", desc=f"{county}: scanning for blanks") as pbar:
-            with ProcessPoolExecutor(max_workers=workers) as executor:
-                future_to_path = {executor.submit(is_fully_blank, p): p for p in tile_paths}
-                for fut in as_completed(future_to_path):
-                    p = future_to_path[fut]
-                    if fut.result():
-                        blank_before.append(p.name)
-                    pbar.update(1)
-                    pbar.set_postfix(blank=len(blank_before))
-
-        if not blank_before:
-            log(f"{county}: {len(tile_paths)} chips checked, none blank - nothing to fix")
-            summary[county_safe] = {"fixed": [], "still_blank": []}
-            continue
-
-        log(f"{county}: {len(blank_before)}/{len(tile_paths)} chip(s) currently blank - "
-            f"force-regenerating this county's chips from the current native mosaic...")
-        for name in blank_before:
-            log(f"    - {name}")
-
-        ensure_canonical_mosaic_for_counties(counties=[county], force=True, max_workers=max_workers)
-
-        log(f"{county}: re-checking the {len(blank_before)} previously-blank chip(s)...")
-        fixed, still_blank = [], []
-        for name in blank_before:
-            p = county_dir / name
-            if p.exists() and not is_fully_blank(p):
-                fixed.append(name)
-            else:
-                still_blank.append(name)
-
-        log(f"{county}: {len(fixed)} chip(s) fixed, {len(still_blank)} still blank "
-            f"(likely a genuine source-imagery gap rather than a caching issue)")
-        summary[county_safe] = {"fixed": fixed, "still_blank": still_blank}
-
-    return summary
-
-CHIP_FILENAME_RE = re.compile(r"^chip_(\d+)_r(-?\d+)_c(-?\d+)\.tif$")
-
-def find_phantom_duplicate_chips(counties: List[str], max_workers: int = 16) -> Dict[str, List[Dict]]:
-    """
-    Scan `counties`' materialized canonical_tiles/*.tif for the multi-CRS-
-    group phantom-duplicate bug (see ensure_canonical_mosaic_for_counties():
-    a native-CRS group's needed cells used to be computed from its overall
-    bounding rectangle rather than its tiles' actual footprint, so a sparse
-    secondary CRS group could wrongly claim - and generate a genuinely-blank
-    chip for - a canonical (row, col) cell that a DIFFERENT CRS group
-    actually covers).
-
-    For each canonical (row, col) cell that has files from more than one
-    epsg prefix, classifies the group:
-      - exactly one non-blank + the rest blank -> the blank one(s) are
-        phantom duplicates, flagged for cleanup.
-      - all blank, or more than one non-blank -> NOT flagged (a genuine
-        source gap, or a legitimate real overlap at a true CRS-zone
-        boundary, respectively) - just reported for visibility.
-
-    This only reads already-materialized canonical_tiles/*.tif files (no raw
-    tiles needed), so it works even for counties whose raw tiles have
-    already been archived+pruned.
-
-    The (potentially large) set of full-resolution blank-checks - one per
-    file that's part of a same-cell duplicate group, across every county -
-    is done in parallel (ProcessPoolExecutor, same pattern as
-    rescan_and_fix_blank_chips) with a single shared tqdm progress bar,
-    rather than one blank-check at a time per county.
-
-    Returns {county_safe: [{"row", "col", "epsg_code", "filename",
-    "local_path"} for every phantom chip found]}.
-    """
-    workers = max(1, min(max_workers, os.cpu_count() or 1))
-
-    # pass 1 (cheap - just filename parsing, no raster I/O): find every
-    # county's duplicate (row, col) cells and collect the full set of
-    # candidate files across ALL counties that actually need a blank check.
-    county_dupe_cells: Dict[str, Dict[Tuple[int, int], List[Path]]] = {}
-    candidate_paths: List[Path] = []
-    for county in counties:
-        county_safe = safe_name(county.strip())
-        county_dir = project_root() / "data" / "counties" / county_safe / "canonical_tiles"
-        tile_paths = sorted(county_dir.glob("*.tif"))
-        if not tile_paths:
-            continue
-
-        by_cell: Dict[Tuple[int, int], List[Path]] = defaultdict(list)
-        for p in tile_paths:
-            m = CHIP_FILENAME_RE.match(p.name)
-            if not m:
-                continue
-            row, col = int(m.group(2)), int(m.group(3))
-            by_cell[(row, col)].append(p)
-
-        dupe_cells = {cell: paths for cell, paths in by_cell.items() if len(paths) > 1}
-        if not dupe_cells:
-            continue
-
-        county_dupe_cells[county_safe] = dupe_cells
-        for paths in dupe_cells.values():
-            candidate_paths.extend(paths)
-
-    if not candidate_paths:
-        return {}
-
-    # pass 2 (expensive - full-resolution raster reads): blank-check every
-    # candidate file once, in parallel, with one shared progress bar.
-    log(f"Blank-checking {len(candidate_paths)} chip(s) across {len(county_dupe_cells)} "
-        f"county folder(s) with duplicate cells ({workers} parallel workers)...")
-    blank_by_path: Dict[Path, bool] = {}
-    with tqdm(total=len(candidate_paths), unit="chip", desc="blank-checking duplicate chips") as pbar:
-        with ProcessPoolExecutor(max_workers=workers) as executor:
-            future_to_path = {executor.submit(is_fully_blank, p): p for p in candidate_paths}
-            for fut in as_completed(future_to_path):
-                p = future_to_path[fut]
-                blank_by_path[p] = fut.result()
-                pbar.update(1)
-
-    # pass 3 (cheap): classify each county's dupe cells using the blank-check results.
-    report: Dict[str, List[Dict]] = {}
-    for county_safe, dupe_cells in county_dupe_cells.items():
-        phantoms: List[Dict] = []
-        all_blank_cells = 0
-        multi_real_cells = 0
-        for (row, col), paths in dupe_cells.items():
-            non_blank = [p for p in paths if not blank_by_path[p]]
-            if len(non_blank) == 1:
-                for p in paths:
-                    if blank_by_path[p]:
-                        m = CHIP_FILENAME_RE.match(p.name)
-                        epsg_num = m.group(1)
-                        phantoms.append({
-                            "row": row,
-                            "col": col,
-                            "epsg_code": f"EPSG:{epsg_num}",
-                            "filename": p.name,
-                            "local_path": p,
-                        })
-            elif len(non_blank) == 0:
-                all_blank_cells += 1
-            else:
-                multi_real_cells += 1
-
-        if phantoms or all_blank_cells or multi_real_cells:
-            log(f"{county_safe}: {len(dupe_cells)} canonical cell(s) with >1 epsg-prefixed chip - "
-                f"{len(phantoms)} confirmed phantom (blank duplicate), "
-                f"{all_blank_cells} all-blank (genuine gap, not a duplicate issue), "
-                f"{multi_real_cells} multiple-real-overlap (legitimate CRS-zone boundary, harmless)")
-        if phantoms:
-            report[county_safe] = phantoms
-
-    return report
-
-def delete_phantom_chips(phantom_report: Dict[str, List[Dict]], dry_run: bool = True) -> Dict[str, int]:
-    """
-    Delete phantom blank duplicate chips identified by
-    find_phantom_duplicate_chips() - removes the local canonical_tiles/*.tif
-    file and its S3 chip object, then rewrites that county's manifest
-    excluding the deleted cells.
-
-    Defaults to dry_run=True (report only, deletes nothing) - pass
-    dry_run=False explicitly to actually delete, since this removes S3 data
-    across every county in `phantom_report`.
-
-    Returns {county_safe: number of phantom chips deleted (0 if dry_run)}.
-    """
-    deleted_counts: Dict[str, int] = {}
-    for county_safe, phantoms in phantom_report.items():
-        if not phantoms:
-            continue
-
-        if dry_run:
-            log(f"[DRY RUN] {county_safe}: would delete {len(phantoms)} phantom chip(s): "
-                f"{[p['filename'] for p in phantoms]}")
-            deleted_counts[county_safe] = 0
-            continue
-
-        county_dir = project_root() / "data" / "counties" / county_safe / "canonical_tiles"
-        deleted = 0
-        for p in phantoms:
-            local_path: Path = p["local_path"]
-            epsg_code, row, col = p["epsg_code"], p["row"], p["col"]
-            key = chip_s3_key(epsg_code, row, col)
-            try:
-                if local_path.exists():
-                    local_path.unlink()
-                s3.delete_object(Bucket=S3_BUCKET, Key=key)
-                deleted += 1
-            except Exception as e:
-                log(f"  ✗ {county_safe}: failed to delete phantom chip {p['filename']}: {e}")
-        log(f"{county_safe}: deleted {deleted}/{len(phantoms)} phantom chip(s)")
-        deleted_counts[county_safe] = deleted
-
-        # rewrite this county's manifest excluding the deleted cells
-        deleted_cells = {(p["epsg_code"], p["row"], p["col"]) for p in phantoms}
-        remaining_tiles = sorted(county_dir.glob("*.tif")) if county_dir.is_dir() else []
-        remaining_cells: List[Tuple[str, int, int]] = []
-        for tp in remaining_tiles:
-            m = CHIP_FILENAME_RE.match(tp.name)
-            if not m:
-                continue
-            epsg_num, row, col = m.group(1), int(m.group(2)), int(m.group(3))
-            cell = (f"EPSG:{epsg_num}", row, col)
-            if cell not in deleted_cells:
-                remaining_cells.append(cell)
-        write_county_manifest(county_safe, county_safe, remaining_cells)
-
-    return deleted_counts

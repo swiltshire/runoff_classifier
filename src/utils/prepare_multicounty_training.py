@@ -1,14 +1,10 @@
 # src/utils/prepare_multicounty_training.py
 
-import os
-import sys
-import glob
 from pathlib import Path
 from typing import List, Dict
 
 import geopandas as gpd
 import pandas as pd
-import numpy as np
 import rasterio
 from rasterio.plot import show
 from rasterio.merge import merge as rio_merge
@@ -57,17 +53,6 @@ def _normalize_class_column(
     gdf["Classname"] = gdf["Classname"].astype(str).str.strip()
 
     return gdf
-
-
-def _raster_bounds(raster_path: str) -> BoundingBox:
-    """Get bounds from a raster file."""
-    with rasterio.open(raster_path) as ds:
-        return ds.bounds
-
-
-def _bounds_intersect(a: BoundingBox, b: BoundingBox) -> bool:
-    """Check if two bounding boxes intersect."""
-    return box(*a).intersects(box(*b))
 
 
 def _plot_overlay(raster_paths, gdf: gpd.GeoDataFrame, title: str) -> None:
@@ -258,7 +243,6 @@ def _filter_singleclass_labels(
     
     # Split negatives target between in-class and out-of-class
     in_class_pct = in_class_ratio / 100.0
-    out_of_class_pct = (100 - in_class_ratio) / 100.0
     
     n_in_class_target = int(n_negatives_target * in_class_pct)
     n_out_of_class_target = n_negatives_target - n_in_class_target

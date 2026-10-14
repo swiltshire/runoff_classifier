@@ -2,7 +2,6 @@ from __future__ import annotations
 import os
 import json
 import argparse
-import time
 from datetime import timedelta
 from contextlib import nullcontext
 import torch
@@ -222,7 +221,6 @@ def main():
         print(f"INFO [debug] dataloader batches per rank ≈ {len(dataloader)}")
         if args.stratified_sampling:
             print(f"INFO [debug] using stratified sampling for balanced class representation")
-    rank_id = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
 
 
     # device per rank
