@@ -13,7 +13,7 @@ from shapely.geometry import box
 import matplotlib.pyplot as plt
 
 from utils.make_vrt import write_mosaic_vrt
-from utils.indiana_cogs import project_root, CANONICAL_CRS as DEFAULT_CANONICAL_CRS
+from utils import states
 
 
 # -----------------------------------------------------------------------------
@@ -314,7 +314,7 @@ def _filter_singleclass_labels(
 # -----------------------------------------------------------------------------
 
 def prepare_multicounty_training(
-    county_data_dir: str,
+    state: str,
     selected_counties: List[str],
     out_labels: str,
     out_vrt: str,
@@ -338,8 +338,10 @@ def prepare_multicounty_training(
 
     Parameters
     ----------
-    county_data_dir : str
-        Root directory containing county subdirs
+    state : str
+        State whose counties are being merged (e.g. "IN"); labels and chips are
+        read from data/{STATE}/counties/{county}/ and labels are reprojected to
+        the state's canonical CRS
     selected_counties : list[str]
         Counties selected in Jupyter
     out_labels : str
@@ -388,7 +390,6 @@ def prepare_multicounty_training(
         Ignored in single-class mode.
     """
 
-    county_data_dir = Path(county_data_dir)
     out_labels = Path(out_labels)
     out_vrt = Path(out_vrt)
 
@@ -408,7 +409,7 @@ def prepare_multicounty_training(
     county_to_tiles: Dict[str, List[Path]] = {}
 
     for c in selected_counties:
-        cdir = county_data_dir / c
+        cdir = states.county_dir(state, c)
 
         shp_files = sorted(cdir.glob("*.shp"))
         if not shp_files:
@@ -427,18 +428,14 @@ def prepare_multicounty_training(
         county_to_tiles[c] = tiles
 
     # -------------------------------------------------------------------------
-    # Target CRS: the pipeline's canonical CRS (every canonical_tiles/ chip is
-    # already reprojected + resampled to this CRS by
-    # ensure_canonical_mosaic_for_counties(), so there is no need to sample or
-    # sanity-check individual tiles here).
+    # Target CRS: the state's canonical CRS (every canonical_tiles/ chip is
+    # already reprojected + resampled to it by
+    # ensure_canonical_mosaic_for_counties()).
     # -------------------------------------------------------------------------
 
-    target_crs = DEFAULT_CANONICAL_CRS
-    _crs_config_file = project_root() / "outputs" / ".reference_crs"
-    if _crs_config_file.exists():
-        target_crs = _crs_config_file.read_text().strip()
+    target_crs = states.require_canonical_crs(state)
 
-    _log(f"Target CRS: {target_crs} (pipeline canonical CRS)")
+    _log(f"Target CRS: {target_crs} ({states.get_state(state).code} canonical CRS)")
 
     # -------------------------------------------------------------------------
     # Load + validate labels per county

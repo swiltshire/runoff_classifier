@@ -5,21 +5,21 @@ canonical chip generation can be launched as a detached background process
 session disconnects / SageMaker Studio forced re-logins killing the kernel.
 
 Usage:
-    mkdir -p outputs/logs
-    nohup python -u scripts/prepare_canonical_mosaic.py --counties "Benton,Boone,Cass" \
-        > outputs/logs/canonical_mosaic_$(date +%Y%m%d_%H%M%S).log 2>&1 &
+    mkdir -p outputs/IN/logs
+    nohup python -u scripts/prepare_canonical_mosaic.py --state IN --counties "Benton,Boone,Cass" \
+        > outputs/IN/logs/canonical_mosaic_$(date +%Y%m%d_%H%M%S).log 2>&1 &
 
     (-u matters: with stdout redirected to a file, Python block-buffers plain
     print() calls, so the log can appear frozen for long stretches otherwise.)
 
     # tail the live log:
-    tail -f outputs/logs/canonical_mosaic_<timestamp>.log
+    tail -f outputs/IN/logs/canonical_mosaic_<timestamp>.log
 
     # confirm it's still running:
     ps aux | grep prepare_canonical_mosaic
 
-Do not run this at the same time as an equivalent notebook cell for the same
-counties - both would race over the same shared per-CRS-group VRT cache files.
+A per-state lock prevents two full-pipeline runs for the same state from
+overlapping (they would race over the shared per-CRS-group VRT cache files).
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ import os
 import sys
 import time
 
-# add project root and src/ to path (prepare_reprojected_tiles.py internally
-# does `from utils.indiana_cogs import ...`, which requires src/ on sys.path)
+# add project root and src/ to path (src/utils modules import each other as
+# `utils.*`, which requires src/ on sys.path)
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 SRC_ROOT = os.path.join(PROJECT_ROOT, "src")
 for _p in (PROJECT_ROOT, SRC_ROOT):
@@ -45,12 +45,16 @@ from utils.prepare_reprojected_tiles import (  # noqa: E402
     ensure_canonical_mosaic_for_counties,
     fetch_county_canonical_chips_from_s3,
 )
-from utils.indiana_cogs import safe_name  # noqa: E402
+from utils.states import STATES  # noqa: E402
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Ensure canonical (mosaic-then-reproject) imagery chips exist for the given counties."
+    )
+    parser.add_argument(
+        "--state", type=str, required=True, choices=sorted(STATES),
+        help="state the counties belong to (e.g. IN)",
     )
     parser.add_argument(
         "--counties", type=str, required=True,
@@ -77,7 +81,8 @@ def main():
     if not counties:
         raise SystemExit("--counties produced an empty list; nothing to do")
 
-    print(f"[prepare_canonical_mosaic] starting for {len(counties)} counties: {counties}", flush=True)
+    state = args.state
+    print(f"[prepare_canonical_mosaic] {state}: starting for {len(counties)} counties: {counties}", flush=True)
     t0 = time.time()
 
     # Manifest fast path: a county's S3 manifest is only written at the very
@@ -94,13 +99,12 @@ def main():
     else:
         full_counties = []
         for county in counties:
-            county_safe = safe_name(county)
-            if county_has_manifest(county_safe):
+            if county_has_manifest(state, county):
                 print(f"[prepare_canonical_mosaic] {county}: manifest found - fetching chips from S3 "
                       f"(no raw tiles needed)", flush=True)
                 try:
-                    result[county_safe] = fetch_county_canonical_chips_from_s3(
-                        county, county_safe, verify_sizes=True
+                    result[county] = fetch_county_canonical_chips_from_s3(
+                        state, county, verify_sizes=True
                     )
                 except ManifestChipsMissingError as e:
                     print(f"[prepare_canonical_mosaic] {county}: stale manifest "
@@ -112,6 +116,7 @@ def main():
 
     if full_counties:
         result.update(ensure_canonical_mosaic_for_counties(
+            state,
             counties=full_counties,
             force=args.force,
             max_workers=args.max_workers,

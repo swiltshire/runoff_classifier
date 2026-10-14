@@ -1,4 +1,7 @@
 # indiana_cogs.py
+"""Indiana raw imagery source: 6-inch orthoimagery tiles from Indiana's
+ArcGIS tile-footprint FeatureServer. Used only for state "IN" (dispatched via
+utils.imagery_sources)."""
 
 import os
 import re
@@ -8,87 +11,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from tqdm import tqdm
 
+from utils.common import ensure_dir, head_length, make_session, safe_name
+
 SERVICE_URL = "https://gisdata.in.gov/server/rest/services/Hosted/Indiana_Orthoimagery_Tile_Footprints/FeatureServer"
-
-# Reference CRS for reprojection (set via set_reference_crs(), persisted to outputs/.reference_crs)
-CANONICAL_CRS = "EPSG:2968"  # Default until set_reference_crs() is called
-
-
-# ---------------- project root ----------------
-
-def project_root() -> Path:
-    """auto-detect project root."""
-    cwd = Path.cwd().resolve()
-    if cwd.name.lower() == "notebooks":
-        return cwd.parent
-    for p in [cwd] + list(cwd.parents):
-        if (p / "data").is_dir() or (p / ".git").is_dir():
-            return p
-    return cwd
-
-
-# ---------------- retry session ----------------
-
-def make_session() -> requests.Session:
-    retry_cfg = Retry(
-        total=8,
-        connect=8,
-        read=8,
-        status=8,
-        backoff_factor=0.6,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["HEAD", "GET"]),
-        respect_retry_after_header=True,
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry_cfg, pool_connections=64, pool_maxsize=64)
-    s = requests.Session()
-    s.headers.update({"accept-encoding": "identity", "connection": "keep-alive"})
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    return s
-
-
-def set_reference_crs(crs: str) -> None:
-    """Update the global reference CRS for re-projection.
-    
-    Args:
-        crs: CRS string (e.g., "EPSG:2968")
-    """
-    global CANONICAL_CRS
-    CANONICAL_CRS = crs
-
-
-# ---------------- helpers ----------------
-
-def ensure_dir(p: Path):
-    p.mkdir(parents=True, exist_ok=True)
-
-def safe_name(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._ -]+", "_", s)
-
-def normalize_county_key(name: str) -> str:
-    """Canonical lookup key for a county name, robust to spacing/casing
-    differences (e.g. "La Porte", "LaPorte", "LAPORTE" all normalize to the
-    same key). Use this at every point where a county name from one source
-    (CSV, notebook widget, folder name) is compared against another, instead
-    of exact string equality.
-    """
-    return re.sub(r"\s+", "", name).strip().lower()
-
-def head_length(session: requests.Session, url: str) -> Optional[int]:
-    try:
-        r = session.head(url, timeout=30)
-        if r.ok:
-            cl = r.headers.get("content-length")
-            return int(cl) if cl else None
-    except (requests.RequestException, ValueError):
-        pass
-    return None
 
 
 # ---------------- defensive validation ----------------
@@ -111,39 +38,6 @@ def matches_remote_size(path: Path, remote_size: Optional[int]) -> bool:
         return path.stat().st_size == remote_size
     except (IOError, OSError):
         return False
-
-
-# ---------------- reference CRS ----------------
-
-def get_remote_crs(url: str) -> str:
-    """Query remote raster CRS without downloading.
-    
-    Opens remote GeoTIFF via rasterio and returns CRS as string.
-    Returns "UNKNOWN" if CRS cannot be determined after retries.
-    
-    Retries up to 2 times with backoff to distinguish network hiccups
-    (which succeed on retry) from actual data corruption (consistent failures).
-    """
-    max_retries = 2
-    
-    for attempt in range(max_retries + 1):
-        try:
-            import rasterio
-            with rasterio.open(url) as ds:
-                if ds.crs:
-                    # Return as "EPSG:code" format if possible
-                    epsg = ds.crs.to_epsg()
-                    if epsg:
-                        return f"EPSG:{epsg}"
-                    return str(ds.crs)
-                return "UNKNOWN"
-        except Exception:
-            # Retry with backoff on transient errors
-            if attempt < max_retries:
-                time.sleep(0.5 * (2 ** attempt))  # exponential backoff: 0.5s, 1s
-                continue
-            # After all retries exhausted, mark as UNKNOWN
-            return "UNKNOWN"
 
 
 # ---------------- FeatureServer queries ----------------
@@ -178,51 +72,6 @@ def county_where(county: str) -> str:
         variants.add(name.replace("'", "''").upper())
         variants.add(re.sub(r"\s+", "", name).replace("'", "''").upper())
     return " OR ".join(f"UPPER(county) LIKE '%{v}%'" for v in sorted(variants))
-
-
-def load_training_imagery_years(csv_path: Path) -> Dict[str, int]:
-    """Load training county to imagery year mapping from CSV.
-    
-    CSV format: County,Data Year (e.g., "Bartholomew,21")
-    Converts 2-digit years to 4-digit (21 -> 2021, 23 -> 2023).
-    
-    Args:
-        csv_path: Path to training_county_imagery_years.csv
-        
-    Returns:
-        Dict mapping normalize_county_key(county name) -> 4-digit year (e.g.,
-        {"bartholomew": 2021, "benton": 2023}). Keys are normalized via
-        `normalize_county_key()` (spaces stripped, lowercased) rather than the
-        raw CSV spelling, so callers must normalize their own county name the
-        same way before looking it up.
-        
-    Raises:
-        FileNotFoundError: If CSV not found
-        ValueError: If CSV format invalid
-    """
-    import csv
-    csv_path = Path(csv_path)
-    if not csv_path.exists():
-        raise FileNotFoundError(f"Imagery years CSV not found: {csv_path}")
-    
-    result = {}
-    with open(csv_path, encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        if not reader.fieldnames or set(reader.fieldnames) != {"County", "Data Year"}:
-            raise ValueError(f"CSV must have exactly columns 'County' and 'Data Year', got: {reader.fieldnames}")
-        
-        for row in reader:
-            county_key = normalize_county_key(row["County"])
-            year_str = row["Data Year"].strip()
-            
-            # Convert 2-digit year to 4-digit
-            year_int = int(year_str)
-            if year_int < 100:
-                year_int = 2000 + year_int
-            
-            result[county_key] = year_int
-    
-    return result
 
 
 def year_to_layer_id(year: int, session: requests.Session) -> Optional[Tuple[int, str]]:
@@ -337,64 +186,6 @@ def find_complete_imagery_year(
             return (year, count, layer_id, layer_name)
 
 
-def quick_reference_crs_from_county(
-    county: str,
-    session: requests.Session,
-    imagery_years_csv: Optional[Path] = None,
-) -> str:
-    """Determine the pipeline's reference CRS by reading a single
-    representative tile from one county.
-
-    Correctness note: with the mosaic-then-reproject architecture (see
-    `prepare_reprojected_tiles.py`), the reference CRS choice is a pure
-    efficiency/convenience decision, not a correctness one - EVERY native-CRS
-    group (including one that already matches the chosen reference CRS) is
-    warped through the same `gdalwarp -t_srs` pipeline, so picking a CRS
-    that isn't the true county-wide majority just means a few more tiles get
-    warped instead of passed through unchanged.
-
-    Args:
-        county: county name to sample (e.g. "Benton")
-        session: requests session
-        imagery_years_csv: optional path to training_county_imagery_years.csv;
-            if provided and `county` has an entry, uses that pinned year
-            (consistent with the rest of the pipeline); otherwise auto-detects
-            the newest/most-complete year for `county`.
-
-    Returns:
-        CRS string, e.g. "EPSG:2968"
-
-    Raises:
-        RuntimeError: if no 6-inch tile / CRS can be found for `county`
-    """
-    imagery_years: Dict[str, int] = {}
-    if imagery_years_csv:
-        imagery_years_csv = Path(imagery_years_csv)
-        if imagery_years_csv.exists():
-            imagery_years = load_training_imagery_years(imagery_years_csv)
-
-    pinned_year = imagery_years.get(normalize_county_key(county))
-    if pinned_year is not None:
-        layer_info = year_to_layer_id(pinned_year, session)
-        if not layer_info:
-            raise RuntimeError(f"CSV specifies year {pinned_year} for {county} but Footprint_{pinned_year} layer not found")
-        layer_id, layer_name = layer_info
-        year = pinned_year
-    else:
-        year, _, layer_id, layer_name = find_complete_imagery_year(session, county)
-
-    layer_url = f"{SERVICE_URL}/{layer_id}"
-    attrs = fetch_attrs(session, layer_url, county_where(county))
-    six_inch = [a for a in attrs if a.get("pixel_size") == "06 in." and a.get("url_tif")]
-    if not six_inch:
-        raise RuntimeError(f"No 6-inch tiles found for {county} in year {year}")
-
-    sample_url = six_inch[0]["url_tif"]
-    crs = get_remote_crs(sample_url)
-    print(f"[Quick CRS] Sampled {county} ({year}, 1 of {len(six_inch)} tiles): {crs}")
-    return crs
-
-
 def fetch_attrs(session: requests.Session, layer_url: str, where: str) -> List[Dict]:
     out = []
     offset = 0
@@ -472,22 +263,27 @@ def download_one(url: str, dest: Path, session: requests.Session) -> str:
 
 # ---------------- public api ----------------
 
-def download_6in_tiles(county: str, max_workers: int = 16, imagery_year: Optional[int] = None) -> Dict:
-    """Download 6-inch tiles for a county.
-    
+def download_6in_tiles(
+    county: str,
+    dest_dir: Path,
+    max_workers: int = 16,
+    imagery_year: Optional[int] = None,
+) -> Dict:
+    """Download a county's 6-inch tiles into `dest_dir`.
+
     Args:
-        county: County name
+        county: Indiana county name
+        dest_dir: destination folder for raw tiles (e.g. data/IN/counties/{county}/tiles)
         max_workers: Thread pool size (default 16)
         imagery_year: Specific year to download (if None, auto-detects most complete year)
-        
+
     Returns:
         Dict with download stats including 'year' showing which year was selected
     """
     s = make_session()
-    root = project_root()
 
     county_dir = safe_name(county.strip())
-    dest_dir = root / "data" / "counties" / county_dir / "tiles"
+    dest_dir = Path(dest_dir)
     ensure_dir(dest_dir)
 
     # Determine which year to use

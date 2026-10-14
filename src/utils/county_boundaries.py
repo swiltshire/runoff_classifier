@@ -7,15 +7,15 @@ src/utils/fast_mask.py and scripts/inference.py --county_mask_path).
 
 Design:
 - The national full-resolution TIGER/Line county file (tl_{year}_us_county.zip,
-  ~80 MB, all US counties) is downloaded ONCE into data/county_boundaries/ and
+  ~80 MB, all US counties) is downloaded ONCE into data/shared/county_boundaries/ and
   kept as the source of truth. Full-res TIGER/Line is used (not the generalized
   cb_*_500k cartographic files) because boundary accuracy matters for the
   majority-inside (>=50% coverage) detection-filter rule at county edges.
 - Each requested county is extracted to a small single-feature GeoJSON cached at
-  data/county_boundaries/{state_fips}/{county}.geojson, so the big zip is only
-  read on cache misses.
-- National scope (keyed by state FIPS, default Indiana "18") so this extends to
-  other states without code changes.
+  data/shared/county_boundaries/{state_fips}/{county}.geojson, so the big zip is
+  only read on cache misses.
+- National scope, keyed by state FIPS. The FIPS is REQUIRED (no default) because
+  many county names exist in several states (e.g. Lake County in IN and IL).
 
 The cached GeoJSON is left in TIGER's native CRS (EPSG:4269); consumers
 (get_mask_clipped in fast_mask.py) reproject to the raster CRS themselves.
@@ -27,14 +27,14 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from .indiana_cogs import (
+from utils.common import (
     ensure_dir,
     head_length,
     make_session,
     normalize_county_key,
-    project_root,
     safe_name,
 )
+from utils.states import county_boundaries_dir
 
 logger = logging.getLogger("county_boundaries")
 
@@ -43,17 +43,11 @@ TIGER_URL_TEMPLATE = (
     "https://www2.census.gov/geo/tiger/TIGER{year}/COUNTY/tl_{year}_us_county.zip"
 )
 
-# State FIPS codes for states this pipeline targets. Extend as needed.
-STATE_FIPS = {
-    "indiana": "18",
-}
-DEFAULT_STATE_FIPS = STATE_FIPS["indiana"]
-
 
 def _boundaries_dir(data_dir: Optional[Path] = None) -> Path:
     if data_dir is not None:
         return Path(data_dir)
-    return project_root() / "data" / "county_boundaries"
+    return county_boundaries_dir()
 
 
 def ensure_national_county_zip(
@@ -106,7 +100,8 @@ def ensure_national_county_zip(
 
 def get_county_boundary_path(
     county: str,
-    state_fips: str = DEFAULT_STATE_FIPS,
+    *,
+    state_fips: str,
     data_dir: Optional[Path] = None,
     year: int = TIGER_YEAR,
 ) -> Path:
@@ -114,7 +109,7 @@ def get_county_boundary_path(
 
     On first request for a county, extracts it from the (downloaded-once)
     national TIGER/Line county file and caches it at
-    data/county_boundaries/{state_fips}/{county}.geojson. Subsequent calls are
+    data/shared/county_boundaries/{state_fips}/{county}.geojson. Subsequent calls are
     a pure existence check.
 
     County name matching uses normalize_county_key() (whitespace/case
