@@ -707,35 +707,51 @@ def cmd_model_upload(args) -> None:
 # =====================================================================
 
 def cmd_compare_detections(args) -> None:
-    """Compare two detections gpkgs: per-class counts, and how many detections
-    match (same class, score within --score_tol, bounds within --bounds_tol)."""
+    """Compare two detections gpkgs. Detections are paired per class by
+    greatest overlap (IoU >= --iou); reports per-class counts, how closely
+    paired detections agree, and the scores of unpaired ones (unpaired
+    detections scored near the 0.75 threshold point to run-to-run GPU
+    nondeterminism rather than different inputs)."""
     import geopandas as gpd
 
     a, b = gpd.read_file(args.old), gpd.read_file(args.new)
-    log(f"old: {len(a)} detections  new: {len(b)} detections  (crs equal: {a.crs == b.crs})")
-    classes = sorted(set(a["classname"]) | set(b["classname"]))
-    for c in classes:
-        log(f"  {c:20s} old={int((a['classname'] == c).sum()):6d} new={int((b['classname'] == c).sum()):6d}")
-
-    def keyed(df):
-        out = {}
-        for cls, score, geom in zip(df["classname"], df["score"], df.geometry):
-            out.setdefault(cls, []).append((float(score), tuple(geom.bounds)))
-        return out
-
-    ka, kb = keyed(a), keyed(b)
-    matched = 0
-    for cls, items in ka.items():
-        pool = list(kb.get(cls, []))
-        for score, bounds in items:
-            for i, (s2, b2) in enumerate(pool):
-                if abs(score - s2) <= args.score_tol and all(abs(x - y) <= args.bounds_tol for x, y in zip(bounds, b2)):
-                    matched += 1
-                    pool.pop(i)
-                    break
-    log(f"matched {matched}/{len(a)} old detections ({matched / max(len(a), 1):.2%}); "
-        f"{len(b) - matched} new-only")
-    if matched == len(a) == len(b):
+    if a.crs != b.crs and a.crs is not None and b.crs is not None:
+        b = b.to_crs(a.crs)
+    log(f"old: {len(a)} detections  new: {len(b)} detections")
+    total_matched = 0
+    min_iou, max_dscore = 1.0, 0.0
+    for cls in sorted(set(a["classname"]) | set(b["classname"])):
+        A = a[a["classname"] == cls].reset_index(drop=True)
+        Bc = b[b["classname"] == cls].reset_index(drop=True)
+        pairs = []
+        if len(A) and len(Bc):
+            for i, geom in enumerate(A.geometry):
+                for j in Bc.sindex.query(geom, predicate="intersects"):
+                    g2 = Bc.geometry.iloc[j]
+                    union = geom.union(g2).area
+                    iou = geom.intersection(g2).area / union if union else 0.0
+                    if iou >= args.iou:
+                        pairs.append((iou, i, int(j)))
+        used_a, used_b, matched = set(), set(), []
+        for iou, i, j in sorted(pairs, reverse=True):
+            if i not in used_a and j not in used_b:
+                used_a.add(i); used_b.add(j); matched.append((iou, i, j))
+        total_matched += len(matched)
+        dscores = [abs(float(A["score"].iloc[i]) - float(Bc["score"].iloc[j])) for _, i, j in matched]
+        if matched:
+            min_iou = min(min_iou, min(m[0] for m in matched))
+            max_dscore = max(max_dscore, max(dscores))
+        only_a = sorted(float(A["score"].iloc[i]) for i in range(len(A)) if i not in used_a)
+        only_b = sorted(float(Bc["score"].iloc[j]) for j in range(len(Bc)) if j not in used_b)
+        log(f"  {cls:18s} old={len(A):5d} new={len(Bc):5d} paired={len(matched):5d}"
+            + (f"  min IoU={min(m[0] for m in matched):.3f} max |dscore|={max(dscores):.4f}" if matched else ""))
+        if only_a:
+            log(f"      old-only scores: {[round(x, 3) for x in only_a]}")
+        if only_b:
+            log(f"      new-only scores: {[round(x, 3) for x in only_b]}")
+    log(f"paired {total_matched}/{len(a)} old and {total_matched}/{len(b)} new detections; "
+        f"min IoU={min_iou:.3f}, max |score diff|={max_dscore:.4f}")
+    if total_matched == len(a) == len(b) and min_iou >= 0.95 and max_dscore <= args.score_tol:
         log("IDENTICAL within tolerance")
 
 
@@ -743,7 +759,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("compare-detections"); p.add_argument("old"); p.add_argument("new")
-    p.add_argument("--score_tol", type=float, default=1e-3); p.add_argument("--bounds_tol", type=float, default=0.5)
+    p.add_argument("--iou", type=float, default=0.5); p.add_argument("--score_tol", type=float, default=0.01)
     p.set_defaults(fn=cmd_compare_detections)
     p = sub.add_parser("s3-inventory"); p.add_argument("--force", action="store_true"); p.set_defaults(fn=cmd_s3_inventory)
     p = sub.add_parser("s3-copy"); p.add_argument("--workers", type=int, default=64); p.add_argument("--dry-run", action="store_true"); p.set_defaults(fn=cmd_s3_copy)
